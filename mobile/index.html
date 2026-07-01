@@ -46,6 +46,9 @@
       <button data-mode="coco" class="on">빠름</button>
       <button data-mode="seg">정밀 보행로</button>
     </div>
+    <button id="navBtn">내비 OFF</button>
+    <button id="videoBtn">동영상</button>
+    <input id="videoFile" type="file" accept="video/*" style="display:none">
     <button id="test">자가검사</button>
   </div>
   <div id="status">모델 로딩 대기…</div>
@@ -63,6 +66,8 @@ const L = window.WalkLogic;
 const engine = new L.WalkingRiskEngine();
 const scheduler = new L.AlertScheduler();
 const tracker = new L.Tracker();
+const navGuide = new L.NavigationGuide();
+let navOn = false;
 
 let mode = "coco";            // coco | seg
 let cocoModel = null, segModel = null;
@@ -106,8 +111,9 @@ function speak(alert){
 function vibrate(level){ if(navigator.vibrate){ navigator.vibrate(level===1?[120,60,120]:[80]); } }
 
 function showCaption(alert){
-  const col={1:"#e01e1e",2:"#e07814",3:"#d2b400",4:"#555"}[alert.level]||"#333";
-  captionEl.textContent = alert.text;
+  // 내비게이션(방향)은 파란색으로 위험 경고와 구분
+  const col = alert.nav ? "#1478e0" : ({1:"#e01e1e",2:"#e07814",3:"#d2b400",4:"#555"}[alert.level]||"#333");
+  captionEl.textContent = (alert.nav?"➤ ":"") + alert.text;
   captionEl.style.background = col+"e6";
 }
 
@@ -140,6 +146,7 @@ function analyzeSeg(res, W, H){
   const ch=Math.max(3, Math.round(map.length/(sw*sh))); // RGB(3) 또는 RGBA(4) 대응
   const cor=corridor(1,1); // 정규화 코리도
   let corTot=0, corWalk=0;
+  let navTot=0, navWalk=0, navSumX=0;  // 방향안내용 전방 보행영역 분포
   const boxes={}; // class -> [minx,miny,maxx,maxy] (정규화)
   const step=2;
   for(let yy=0; yy<sh; yy+=step){
@@ -152,6 +159,10 @@ function analyzeSeg(res, W, H){
       // 코리도(전방 경로) 내부인가
       if(nx>=cor.x1 && nx<=cor.x2 && ny>=cor.y1){
         corTot++; if(WALKABLE.has(cls)) corWalk++;
+      }
+      // 방향안내용 전방 넓은 밴드(보도가 어디로 이어지나)
+      if(nx>=0.15 && nx<=0.85 && ny>=0.5){
+        navTot++; if(WALKABLE.has(cls)){ navWalk++; navSumX+=nx; }
       }
       // 장애물 클래스 bbox 누적(전체 프레임)
       const oc=SEG_OBST[cls];
@@ -167,7 +178,11 @@ function analyzeSeg(res, W, H){
   const walkFrac = corTot? corWalk/corTot : 0;
   if(corTot>20 && walkFrac<0.35) env.obstacle="front";  // 전방 경로가 대부분 보행불가 → 장애물/차단
   else if(corTot>20 && walkFrac<0.6) env.boundary=true;  // 경로 절반 이하 보행가능 → 보도 끝/벗어남
-  return {dets, env};
+  // 내비게이션 방향: 보행영역 비율 + 중심 x → FRONT/LEFT/RIGHT/STOP
+  const navFrac = navTot? navWalk/navTot : 0;
+  const navCx = navWalk? navSumX/navWalk : 0.5;
+  const nav = { dir: L.walkDirection(navFrac, navCx), frac:navFrac, cx:navCx };
+  return {dets, env, nav};
 }
 
 // ---------------- 오버레이 ----------------
@@ -194,18 +209,23 @@ async function loop(){
   if(W&&H){
     const t=performance.now()/1000;
     const moving=estimateMoving();
-    let dets=[], env=null;
+    let dets=[], env=null, nav=null;
     try{
       if(mode==="coco" && cocoModel){
         dets = cocoToDets(await cocoModel.detect(video, 20));
       } else if(mode==="seg" && segModel){
         const res = await segModel.segment(video);
-        const a = analyzeSeg(res, W, H); dets=a.dets; env=a.env;
+        const a = analyzeSeg(res, W, H); dets=a.dets; env=a.env; nav=a.nav;
       }
     }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
     const hazards = engine.process(dets, env, W, H);
-    for(const al of scheduler.feed(hazards, t, moving)){
-      showCaption(al); speak(al); vibrate(al.level);
+    const alerts = scheduler.feed(hazards, t, moving);
+    for(const al of alerts){ showCaption(al); speak(al); vibrate(al.level); }
+    // 내비게이션(방향): 위험이 없을 때만, 위험이 있으면 완전 억제(안전 우선)
+    if(navOn && nav){
+      const navAlert = navGuide.update(nav.dir, t, {moving, hazardActive: hazards.length>0});
+      if(navAlert && alerts.length===0){ showCaption(navAlert); speak(navAlert); }
+      $("#mode").textContent = (mode==="coco"?"빠름":"정밀") + " ▸" + nav.dir;
     }
     drawOverlay(dets, W, H);
     $("#mv").textContent = moving?"보행중":"정지";
@@ -215,24 +235,53 @@ async function loop(){
 }
 
 // ---------------- 시작/정지/모드 ----------------
-async function start(){
-  try{
-    statusEl.textContent="카메라 여는 중…";
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280}},audio:false});
-    video.srcObject=stream; await video.play();
-  }catch(e){ statusEl.textContent="카메라 실패: "+e.message+" (HTTPS 필요)"; return; }
-  // iOS 음성 잠금 해제 (사용자 제스처 안에서 1회 발화)
+function primeVoice(){ // iOS 음성 잠금 해제 (사용자 제스처 안 1회 발화)
   if("speechSynthesis" in window){ const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
+}
+async function ensureModel(){
   statusEl.textContent="모델 로딩…";
   if(mode==="coco" && !cocoModel) cocoModel = await cocoSsd.load({base:"lite_mobilenet_v2"});
   if(mode==="seg" && !segModel) segModel = await deeplab.load({base:"cityscapes",quantizationBytes:2});
-  statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름(객체)":"정밀 보행로(전봇대·보도)");
-  running=true; $("#start").style.display="none"; $("#stopb").style.display="";
-  fpsT=performance.now()/1000; loop();
 }
-function stop(){ running=false; if(stream){stream.getTracks().forEach(t=>t.stop());} $("#start").style.display=""; $("#stopb").style.display="none"; captionEl.textContent="정지됨"; captionEl.style.background="rgba(0,0,0,.55)"; if("speechSynthesis"in window)speechSynthesis.cancel(); }
+function beginLoop(label){
+  navGuide.stable=null; navGuide.cand=null;
+  running=true; $("#start").style.display="none"; $("#stopb").style.display="";
+  statusEl.textContent="동작 중 — "+label; fpsT=performance.now()/1000; loop();
+}
+async function start(){       // 카메라 모드
+  try{
+    statusEl.textContent="카메라 여는 중…";
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280}},audio:false});
+    video.srcObject=stream; video.loop=false; await video.play();
+  }catch(e){ statusEl.textContent="카메라 실패: "+e.message+" (HTTPS 필요)"; return; }
+  primeVoice(); await ensureModel();
+  beginLoop(mode==="coco"?"빠름(객체)":"정밀 보행로(전봇대·보도)");
+}
+async function startVideo(file){  // 동영상 파일 모드 (PC/폰 공통, 카메라·방화벽 불필요)
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  video.srcObject=null; video.src=URL.createObjectURL(file); video.loop=true; video.muted=true;
+  primeVoice();
+  try{ await video.play(); }catch(e){ statusEl.textContent="영상 재생 실패: "+e.message; return; }
+  await ensureModel();
+  beginLoop("동영상 테스트 — "+(mode==="coco"?"빠름":"정밀 보행로"));
+}
+function stop(){
+  running=false;
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  try{ video.pause(); }catch(e){}
+  $("#start").style.display=""; $("#stopb").style.display="none";
+  captionEl.textContent="정지됨"; captionEl.style.background="rgba(0,0,0,.55)";
+  if("speechSynthesis"in window)speechSynthesis.cancel();
+}
 
 $("#start").onclick=start; $("#stopb").onclick=stop;
+$("#navBtn").onclick=()=>{
+  navOn=!navOn; $("#navBtn").textContent="내비 "+(navOn?"ON":"OFF");
+  $("#navBtn").style.background=navOn?"#1e7a3a":"#1c2a55";
+  if(navOn && mode!=="seg") statusEl.textContent="내비게이션은 '정밀 보행로' 모드에서 동작합니다.";
+};
+$("#videoBtn").onclick=()=>$("#videoFile").click();
+$("#videoFile").onchange=e=>{ const f=e.target.files[0]; if(f) startVideo(f); };
 $("#modeSeg").onclick=async e=>{
   const b=e.target.closest("button[data-mode]"); if(!b) return;
   [...$("#modeSeg").children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
@@ -245,12 +294,12 @@ $("#modeSeg").onclick=async e=>{
   }
 };
 $("#test").onclick=()=>{
-  const r=L.selfTest();
+  const r=[...L.selfTest(), ...L.selfTestNav()];
   const ok=r.every(x=>x[1]);
-  statusEl.textContent="자가검사: "+r.map(x=>x[0]+(x[1]?"✓":"✗")).join(" · ")+(ok?"  → 전부 통과":"  → 실패");
+  statusEl.textContent="자가검사: "+r.map(x=>x[0]+(x[1]?"✓":"✗")).join(" · ")+(ok?"  → 통과":"  → 실패");
   console.log("selfTest", r);
 };
-window.__selfTest = L.selfTest;   // 자동 검증용
+window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav()];   // 자동 검증용
 </script>
 </body>
 </html>

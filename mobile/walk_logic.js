@@ -96,6 +96,11 @@
     crosswalk_front: "앞 횡단보도",
     signal_wait: "신호 대기",
     offpath_warn: "보행로를 벗어남",
+    // 내비게이션(방향 안내) — AI Guide Dog 논문의 전/좌/우 예측을 보행가능영역에서 유도
+    nav_front: "직진",
+    nav_left: "왼쪽으로",
+    nav_right: "오른쪽으로",
+    nav_stop: "정지, 길 막힘",
   };
   function render(kind, side) { return (PHRASES[kind] || kind).replace("{side}", side || "앞"); }
 
@@ -204,6 +209,46 @@
     _pruneLow(t) { while (this.lowEmits.length && (t - this.lowEmits[0]) > RATE_WINDOW) this.lowEmits.shift(); }
   }
 
+  // ---------------- navigation (방향 안내) ----------------
+  // AI Guide Dog(2501.07957)의 전/좌/우 경로 예측을 '보행가능영역 방향'에서 유도.
+  // 안내 규칙: ①방향이 바뀔 때만 말함(연속 잔소리 금지) ②히스테리시스로 흔들림 억제
+  //           ③위험 경고(L1/L2)가 있으면 침묵(안전 우선) ④정지 중엔 STOP 외 침묵
+  const NAV_PERSIST = 4;      // 방향 확정에 필요한 연속 프레임 (~2s @ 2fps)
+  const NAV_REMIND = 9.0;     // 같은 방향 유지 시 재안내 간격(초)
+  const NAV_COOLDOWN = 2.5;   // 최소 발화 간격(초)
+
+  class NavigationGuide {
+    constructor() { this.stable = null; this.cand = null; this.candCnt = 0; this.lastSpoke = -1e9; }
+    // dir: "FRONT"|"LEFT"|"RIGHT"|"STOP"|null,  opts:{moving, hazardActive}
+    update(dir, t, opts) {
+      opts = opts || {};
+      if (dir == null) return null;
+      if (dir === this.cand) this.candCnt++; else { this.cand = dir; this.candCnt = 1; }
+      let changed = false;
+      if (this.candCnt >= NAV_PERSIST && dir !== this.stable) { this.stable = dir; changed = true; }
+      if (this.stable == null) return null;
+      if (opts.hazardActive) return null;                        // 위험 우선 → 내비 침묵
+      if (!opts.moving && this.stable !== "STOP") return null;    // 정지 중 방향안내 억제
+      // 방향 전환(changed)은 히스테리시스가 이미 걸러주므로 즉시 안내(쿨다운 우회).
+      // 같은 방향 유지 재안내(due)만 쿨다운/재안내 간격 적용.
+      const due = (t - this.lastSpoke) >= NAV_REMIND;
+      if (changed || (due && (t - this.lastSpoke) >= NAV_COOLDOWN)) {
+        this.lastSpoke = t;
+        const kind = { FRONT: "nav_front", LEFT: "nav_left", RIGHT: "nav_right", STOP: "nav_stop" }[this.stable];
+        return { level: this.stable === "STOP" ? 2 : 3, kind, side: "CENTER", text: render(kind, "앞"), nav: true };
+      }
+      return null;
+    }
+  }
+
+  // 보행가능영역 요약(walkFrac, 중심 cx) → 방향(FRONT/LEFT/RIGHT/STOP)
+  function walkDirection(walkFrac, cx) {
+    if (walkFrac < 0.22) return "STOP";        // 전방 경로 대부분 막힘/끝
+    if (cx < 0.42) return "LEFT";
+    if (cx > 0.58) return "RIGHT";
+    return "FRONT";
+  }
+
   // ---------------- self-test (파이썬 테스트 미러) ----------------
   function selfTest() {
     const W = 1280, H = 720;
@@ -229,10 +274,33 @@
     return results;
   }
 
+  function selfTestNav() {
+    const runNav = (dirs, opts) => {
+      const g = new NavigationGuide(), out = [];
+      dirs.forEach((d, i) => { const a = g.update(d, i / 2, opts ? opts[i] : { moving: true }); if (a) out.push([i, a.text]); });
+      return out;
+    };
+    const R = [];
+    // 방향 변경 시에만 안내: FRONT 확정 → RIGHT 확정 → 두 번만
+    let o = runNav(["FRONT","FRONT","FRONT","FRONT","RIGHT","RIGHT","RIGHT","RIGHT"]);
+    R.push(["변경시 안내", o.length === 2 && o[0][1] === "직진" && o[1][1] === "오른쪽으로", o]);
+    // 흔들림(FRONT/RIGHT 교대) → 확정 안 됨 → 발화 0
+    o = runNav(["FRONT","RIGHT","FRONT","RIGHT","FRONT","RIGHT","FRONT","RIGHT"]);
+    R.push(["히스테리시스 흔들림 억제", o.length === 0, o]);
+    // 위험 중이면 내비 침묵
+    o = runNav(Array(8).fill("LEFT"), Array(8).fill({ moving: true, hazardActive: true }));
+    R.push(["위험 중 내비 침묵", o.length === 0, o]);
+    // STOP 은 정지 중에도 안내
+    o = runNav(Array(8).fill("STOP"), Array(8).fill({ moving: false }));
+    R.push(["길막힘 정지안내", o.some(x => x[1].includes("막힘")), o]);
+    return R;
+  }
+
   global.WalkLogic = {
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
-    Tracker, WalkingRiskEngine, AlertScheduler, render, selfTest,
+    Tracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection,
+    render, selfTest, selfTestNav,
     STATIC_OBST, VEHICLE, MOTO, PERSON,
   };
 })(typeof window !== "undefined" ? window : globalThis);
