@@ -48,12 +48,19 @@
     </div>
     <button id="dangerBtn" style="background:#7a2030">위험만</button>
     <button id="navBtn">내비 OFF</button>
+    <button id="depthBtn">깊이(실험)</button>
     <button id="sound">🔊 소리</button>
     <button id="videoBtn">동영상</button>
     <input id="videoFile" type="file" accept="video/*" style="display:none">
     <button id="test">자가검사</button>
   </div>
   <div id="status">모델 로딩 대기…</div>
+</div>
+
+<!-- WebXR 깊이 세션용 화면 오버레이(자막) -->
+<div id="xrOverlay" style="display:none;position:fixed;inset:0;pointer-events:none;z-index:50">
+  <div id="xrCap" style="position:absolute;left:0;right:0;bottom:12%;text-align:center;font-size:9vw;font-weight:800;color:#fff;padding:16px;text-shadow:0 2px 8px #000"></div>
+  <button id="xrEnd" style="position:absolute;top:14px;right:14px;pointer-events:auto;font-size:16px;font-weight:700;padding:10px 16px;border-radius:10px;border:0;background:#3a1030;color:#fff">종료</button>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
@@ -349,7 +356,64 @@ function stop(){
   if("speechSynthesis"in window)speechSynthesis.cancel();
 }
 
+// ---------------- 깊이(WebXR/ARCore, 안드로이드 Chrome) ----------------
+let xrSession=null, xrRef=null;
+function xrCap(text,bg){ const e=$("#xrCap"); if(e){ e.textContent=text; e.style.background=(bg||"#e07814")+"e6"; } }
+function sampleDepthGrid(dep){
+  const rows=5, cols=5, grid=[];
+  for(let r=0;r<rows;r++){ const row=[]; const ny=0.45+0.50*(r/(rows-1));
+    for(let c=0;c<cols;c++){ const nx=0.30+0.40*(c/(cols-1));
+      let d=null; try{ d=dep.getDepthInMeters(nx,ny); }catch(e){}
+      row.push((d&&isFinite(d))?d:null);
+    } grid.push(row);
+  }
+  return grid;
+}
+async function startDepth(){
+  statusEl.textContent="깊이(실험) 준비…";
+  if(!("xr" in navigator)){ statusEl.textContent="WebXR 미지원 — 안드로이드 Chrome 최신 필요(아이폰은 불가)"; return; }
+  let sup=false; try{ sup=await navigator.xr.isSessionSupported("immersive-ar"); }catch(e){}
+  if(!sup){ statusEl.textContent="이 폰/브라우저는 AR(immersive-ar) 미지원 — ARCore 필요"; return; }
+  primeVoice();
+  let sess;
+  try{
+    sess=await navigator.xr.requestSession("immersive-ar",{
+      requiredFeatures:["depth-sensing"],
+      optionalFeatures:["dom-overlay"],
+      depthSensing:{usagePreference:["cpu-optimized"],dataFormatPreference:["luminance-alpha","float32"]},
+      domOverlay:{root:$("#xrOverlay")}
+    });
+  }catch(e){ statusEl.textContent="깊이 세션 실패: "+e.message+" — 기기가 ARCore 깊이 미지원일 수 있음"; return; }
+  xrSession=sess;
+  const gl=document.createElement("canvas").getContext("webgl",{xrCompatible:true});
+  try{ await gl.makeXRCompatible(); }catch(e){}
+  sess.updateRenderState({baseLayer:new XRWebGLLayer(sess,gl)});
+  xrRef=await sess.requestReferenceSpace("viewer");
+  $("#xrOverlay").style.display=""; navGuide.stable=null;
+  let noDepth=0;
+  sess.addEventListener("end", ()=>{ xrSession=null; $("#xrOverlay").style.display="none"; statusEl.textContent="깊이 종료 · "+ttsStatus(); });
+  const onFrame=(tms, frame)=>{
+    if(!xrSession) return;
+    xrSession.requestAnimationFrame(onFrame);
+    const layer=sess.renderState.baseLayer;
+    if(layer){ gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); }
+    const pose=frame.getViewerPose(xrRef); if(!pose) return;
+    for(const view of pose.views){
+      let dep=null; try{ dep=frame.getDepthInformation(view); }catch(e){}
+      if(!dep){ if(++noDepth===45){ xrCap("깊이 데이터 없음(기기 미지원)","#3a1030"); } continue; }
+      noDepth=0;
+      const hz=L.analyzeDepth(sampleDepthGrid(dep));   // 실측 위험만
+      for(const al of scheduler.feed(hz, tms/1000, true)){ xrCap(al.text, al.level===1?"#e01e1e":"#e07814"); speak(al); vibrate(al.level); }
+      break;
+    }
+  };
+  sess.requestAnimationFrame(onFrame);
+  statusEl.textContent="깊이(실험) 동작 중 — 전방 물체/턱을 실측 감지";
+}
+
 $("#start").onclick=start; $("#stopb").onclick=stop;
+$("#depthBtn").onclick=startDepth;
+$("#xrEnd").onclick=()=>{ if(xrSession) try{ xrSession.end(); }catch(e){} };
 $("#navBtn").onclick=()=>{
   navOn=!navOn; $("#navBtn").textContent="내비 "+(navOn?"ON":"OFF");
   $("#navBtn").style.background=navOn?"#1e7a3a":"#1c2a55";
@@ -381,15 +445,15 @@ $("#modeSeg").onclick=async e=>{
   }
 };
 $("#test").onclick=()=>{
-  const r=[...L.selfTest(), ...L.selfTestNav()];
+  const r=window.__selfTest();
   const ok=r.every(x=>x[1]);
-  statusEl.textContent="자가검사: "+r.map(x=>x[0]+(x[1]?"✓":"✗")).join(" · ")+(ok?"  → 통과":"  → 실패");
+  statusEl.textContent="자가검사 "+r.filter(x=>x[1]).length+"/"+r.length+(ok?" 통과":" 실패");
   console.log("selfTest", r);
 };
-window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav()];   // 자동 검증용
+window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth()];   // 자동 검증용
 
 // 로딩 시 음성 가용 여부 표기(voiceschanged 후 갱신)
-function refreshVoiceStatus(){ if(!running) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }
+function refreshVoiceStatus(){ if(!running && !xrSession) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }
 if("speechSynthesis" in window) speechSynthesis.addEventListener("voiceschanged", ()=>{ pickVoice(); refreshVoiceStatus(); });
 refreshVoiceStatus();
 </script>

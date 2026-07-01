@@ -257,6 +257,36 @@
     return "FRONT";
   }
 
+  // ---------------- depth (WebXR/ARCore, 안드로이드) ----------------
+  // 깊이 그리드(미터, rows×cols, 무효=null) → 위험. 클래스 몰라도 '가까운 물체/바닥 꺼짐'을 실측으로.
+  const DEPTH_NEAR_M = 0.6, DEPTH_MID_M = 1.2, DROP_JUMP_M = 0.5;
+  function analyzeDepth(grid, cfg) {
+    cfg = cfg || {};
+    const nearM = cfg.nearM || DEPTH_NEAR_M, midM = cfg.midM || DEPTH_MID_M, dropM = cfg.dropM || DROP_JUMP_M;
+    const R = grid.length; if (!R) return [];
+    const C = grid[0].length;
+    const c0 = Math.floor(C / 3), c1 = Math.ceil(C * 2 / 3);   // 중앙 컬럼
+    const val = v => (v != null && isFinite(v) && v > 0) ? v : null;
+    const mk = (level, kind, prox) => ({ level, kind, side: "CENTER", conf: 1, prox, key: kind + ":CENTER" });
+    const hz = [];
+    // 1) 전방 장애물: 상단~중단(바닥행 제외) 중앙의 최소 깊이 = 가장 가까운 물체
+    let obst = null;
+    for (let r = 0; r < Math.max(1, R - 2); r++) for (let c = c0; c < c1; c++) {
+      const d = val(grid[r][c]); if (d != null && (obst == null || d < obst)) obst = d;
+    }
+    if (obst != null) {
+      if (obst < nearM) hz.push(mk(2, "obstacle_front", 0.95));
+      else if (obst < midM) hz.push(mk(2, "obstacle_front", 0.6));
+    }
+    // 2) 바닥 꺼짐(내려가는 턱/계단): 발 앞 바닥이 그 위 행보다 더 멀면 = 바닥이 꺼짐
+    const cc = Math.floor((c0 + c1) / 2);
+    const fB = val(grid[R - 1] && grid[R - 1][cc]);
+    const fU = val(grid[R - 2] && grid[R - 2][cc]);
+    if (fB != null && fU != null && (fB - fU) > dropM) hz.push(mk(2, "curb_front", 0.85));
+    hz.sort((a, b) => a.level - b.level || b.prox - a.prox);
+    return hz;
+  }
+
   // ---------------- self-test ----------------
   function selfTest() {
     const W = 1280, H = 720;
@@ -305,10 +335,21 @@
     return R;
   }
 
+  function selfTestDepth() {
+    const clear = Array.from({ length: 5 }, () => Array(5).fill(3.0));
+    const obst = clear.map(r => r.slice()); obst[1][2] = 0.5;   // 전방 중앙 0.5m 물체
+    const drop = clear.map(r => r.slice()); drop[4][2] = 3.2; drop[3][2] = 0.9;  // 발앞 바닥이 더 멂
+    return [
+      ["깊이 장애물 감지", analyzeDepth(obst).some(h => h.kind === "obstacle_front"), analyzeDepth(obst)],
+      ["깊이 빈길 무경고", analyzeDepth(clear).length === 0, analyzeDepth(clear)],
+      ["깊이 바닥꺼짐(턱)", analyzeDepth(drop).some(h => h.kind === "curb_front"), analyzeDepth(drop)],
+    ];
+  }
+
   global.WalkLogic = {
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
-    Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection,
-    render, selfTest, selfTestNav, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
+    Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth,
+    render, selfTest, selfTestNav, selfTestDepth, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
   };
 })(typeof window !== "undefined" ? window : globalThis);
