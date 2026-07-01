@@ -48,6 +48,8 @@
     </div>
     <button id="dangerBtn" style="background:#7a2030">위험만</button>
     <button id="navBtn">내비 OFF</button>
+    <button id="geoBtn">위치안내 OFF</button>
+    <button id="poiAdd">여기 지점</button>
     <button id="depthBtn">깊이(실험)</button>
     <button id="sound">🔊 소리</button>
     <button id="videoBtn">동영상</button>
@@ -471,9 +473,43 @@ async function startDepth(){
   statusEl.textContent="깊이(실험) 동작 중 — 전방 물체/턱을 실측 감지";
 }
 
+// ---------------- 위치안내(공공데이터 지오펜스: 음향신호기·횡단보도) ----------------
+// GPS로 근처 POI 감지 → 한국어 음성. 카메라 없이도 동작. 학습 불필요.
+let geoWatchId=null, poiList=[], geoOn=false, lastGeo=null;
+const poiAnnouncer=new L.POIAnnouncer(20);
+(async function loadPOIs(){ try{ const r=await fetch("poi.json"); if(r.ok) poiList=await r.json(); }catch(e){} })();
+function onGeo(pos){
+  const c=pos.coords; lastGeo={lat:c.latitude, lon:c.longitude};
+  const user={lat:c.latitude, lon:c.longitude, heading:(c.heading!=null && !isNaN(c.heading))?c.heading:null};
+  const nearby=L.geo.checkPOIs(user, poiList, 30);
+  for(const n of poiAnnouncer.update(nearby, pos.timestamp/1000)){
+    const al={ level:(n.kind==="acoustic_signal"?3:4), kind:n.kind, side:n.side, text:L.render(n.kind, L.geo.sideWord(n.side)) };
+    showCaption(al); speak(al); vibrate(al.level);
+  }
+  const near=nearby[0];
+  statusEl.textContent="위치안내 · POI "+poiList.length+"개"+(near?(" · 근처 "+Math.round(near.dist)+"m"):"");
+}
+function startGeo(){
+  if(!("geolocation" in navigator)){ statusEl.textContent="이 기기는 위치(GPS) 미지원"; return; }
+  primeVoice();
+  geoWatchId=navigator.geolocation.watchPosition(onGeo, e=>{ statusEl.textContent="위치 오류: "+e.message+" (HTTPS·권한 필요)"; },
+    {enableHighAccuracy:true, maximumAge:1000, timeout:12000});
+  geoOn=true; $("#geoBtn").textContent="위치안내 ON"; $("#geoBtn").style.background="#1e7a3a";
+  statusEl.textContent="위치안내 ON — 음향신호기/횡단보도 접근 시 안내";
+}
+function stopGeo(){ if(geoWatchId!=null){ navigator.geolocation.clearWatch(geoWatchId); geoWatchId=null; }
+  geoOn=false; $("#geoBtn").textContent="위치안내 OFF"; $("#geoBtn").style.background="#1c2a55"; }
+function addTestPOI(kind){
+  if(!lastGeo){ statusEl.textContent="먼저 '위치안내 ON'으로 위치를 잡은 뒤 추가하세요"; return; }
+  poiList.push({id:"test_"+Date.now().toString().slice(-5), kind, lat:lastGeo.lat, lon:lastGeo.lon});
+  statusEl.textContent="여기에 음향신호기 테스트 지점 추가 — 20~30m 멀어졌다 다시 오면 안내됩니다";
+}
+
 $("#start").onclick=start; $("#stopb").onclick=stop;
 $("#depthBtn").onclick=startDepth;
 $("#xrEnd").onclick=()=>{ if(xrSession) try{ xrSession.end(); }catch(e){} };
+$("#geoBtn").onclick=()=>{ if(geoOn) stopGeo(); else startGeo(); };
+$("#poiAdd").onclick=()=>addTestPOI("acoustic_signal");
 $("#navBtn").onclick=()=>{
   navOn=!navOn; $("#navBtn").textContent="내비 "+(navOn?"ON":"OFF");
   $("#navBtn").style.background=navOn?"#1e7a3a":"#1c2a55";
@@ -510,7 +546,7 @@ $("#test").onclick=()=>{
   statusEl.textContent="자가검사 "+r.filter(x=>x[1]).length+"/"+r.length+(ok?" 통과":" 실패");
   console.log("selfTest", r);
 };
-window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth()];   // 자동 검증용
+window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth(), ...L.selfTestGeo()];   // 자동 검증용
 
 // 로딩 시 음성 가용 여부 표기(voiceschanged 후 갱신)
 function refreshVoiceStatus(){ if(!running && !xrSession) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }

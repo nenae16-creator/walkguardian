@@ -1,0 +1,5 @@
+[
+  { "id": "sample_ac_1", "kind": "acoustic_signal", "lat": 37.56650, "lon": 126.97800, "name": "시청 앞 음향신호기(샘플)" },
+  { "id": "sample_cw_1", "kind": "crosswalk_front", "lat": 37.56630, "lon": 126.97790, "name": "시청 앞 횡단보도(샘플)" },
+  { "id": "sample_ac_2", "kind": "acoustic_signal", "lat": 37.57110, "lon": 126.97660, "name": "광화문 음향신호기(샘플)" }
+]

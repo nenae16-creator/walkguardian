@@ -114,6 +114,7 @@
     braille_on: "점자블록 위",
     crosswalk_front: "앞 횡단보도",
     signal_wait: "신호 대기",
+    acoustic_signal: "{side} 음향신호기",
     offpath_warn: "보행로를 벗어남",
     nav_front: "직진",
     nav_left: "왼쪽으로",
@@ -369,10 +370,77 @@
     ];
   }
 
+  // ---------------- geofence (공공데이터 POI: 음향신호기·횡단보도) ----------------
+  // GPS 위치로 근처 POI를 감지해 방향과 함께 안내. 카메라 없이 GPS만으로 동작.
+  const R_EARTH = 6371000, DEG = Math.PI / 180;
+  function haversine(a1, o1, a2, o2) {
+    const dLat = (a2 - a1) * DEG, dLon = (o2 - o1) * DEG;
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(a1 * DEG) * Math.cos(a2 * DEG) * Math.sin(dLon / 2) ** 2;
+    return 2 * R_EARTH * Math.asin(Math.min(1, Math.sqrt(s)));
+  }
+  function bearing(a1, o1, a2, o2) {
+    const y = Math.sin((o2 - o1) * DEG) * Math.cos(a2 * DEG);
+    const x = Math.cos(a1 * DEG) * Math.sin(a2 * DEG) - Math.sin(a1 * DEG) * Math.cos(a2 * DEG) * Math.cos((o2 - o1) * DEG);
+    return (Math.atan2(y, x) / DEG + 360) % 360;
+  }
+  function relSide(heading, brg) {                 // 사용자 진행방향 대비 POI 상대 방향
+    if (heading == null) return CENTER;            // 방향 모르면 '앞'으로 통일
+    const d = ((brg - heading + 540) % 360) - 180; // [-180,180]
+    if (Math.abs(d) > 135) return "BEHIND";
+    if (Math.abs(d) < 25) return CENTER;
+    return d < 0 ? LEFT : RIGHT;
+  }
+  // user={lat,lon,heading}, pois=[{id,kind,lat,lon}] → 반경 내 POI(뒤쪽 제외), 가까운 순
+  function checkPOIs(user, pois, radius) {
+    radius = radius || 30; const out = [];
+    for (const p of pois) {
+      const dist = haversine(user.lat, user.lon, p.lat, p.lon);
+      if (dist > radius) continue;
+      const side = relSide(user.heading, bearing(user.lat, user.lon, p.lat, p.lon));
+      if (side === "BEHIND") continue;
+      out.push({ id: p.id, kind: p.kind, dist, side });
+    }
+    out.sort((a, b) => a.dist - b.dist);
+    return out;
+  }
+  // 진입(edge)에서 1회만 안내 + POI별 쿨다운. GPS 갱신율(~1Hz)에 맞춤.
+  class POIAnnouncer {
+    constructor(cooldown = 20) { this.cd = cooldown; this.last = new Map(); this.inside = new Set(); }
+    update(nearby, t) {
+      const now = new Set(nearby.map(n => n.id)), out = [];
+      for (const n of nearby) {
+        const was = this.inside.has(n.id), last = this.last.get(n.id);
+        if (!was && (last == null || (t - last) >= this.cd)) { out.push(n); this.last.set(n.id, t); }
+      }
+      this.inside = now;
+      return out;
+    }
+  }
+
+  function selfTestGeo() {
+    const R = [];
+    const near111 = haversine(37.5000, 127.0000, 37.5010, 127.0000); // 0.001° 위도 ≈ 111m
+    R.push(["거리(haversine)", near111 > 105 && near111 < 118, Math.round(near111)]);
+    // 북쪽 20m 앞 음향신호기 + 남쪽(뒤) 횡단보도, heading=북(0)
+    const user = { lat: 37.5, lon: 127.0, heading: 0 };
+    const pois = [
+      { id: "a", kind: "acoustic_signal", lat: 37.5 + 0.00018, lon: 127.0 }, // 북 ~20m
+      { id: "b", kind: "crosswalk_front", lat: 37.5 - 0.00030, lon: 127.0 }, // 남(뒤) ~33m
+    ];
+    const near = checkPOIs(user, pois, 30);
+    R.push(["앞 POI 감지·뒤 제외", near.length === 1 && near[0].id === "a" && near[0].side === CENTER, near]);
+    // 진입 1회만 안내
+    const an = new POIAnnouncer(20);
+    const a1 = an.update(near, 0), a2 = an.update(near, 1), a3 = an.update([], 2), a4 = an.update(near, 25);
+    R.push(["진입 1회+쿨다운", a1.length === 1 && a2.length === 0 && a4.length === 1, [a1.length, a2.length, a4.length]]);
+    return R;
+  }
+
   global.WalkLogic = {
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
-    Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth,
-    render, selfTest, selfTestNav, selfTestDepth, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
+    geo: { haversine, bearing, relSide, checkPOIs, sideWord },
+    Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth, POIAnnouncer,
+    render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
   };
 })(typeof window !== "undefined" ? window : globalThis);
