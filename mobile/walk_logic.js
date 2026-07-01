@@ -1,6 +1,6 @@
-/* walk_logic.js — 걸음지기 코어 로직 (Python walkguardian 의 JS 포팅)
- * geometry / risk(L1~L4) / scheduler(디바운스·쿨다운·인터럽트·레이트리밋·정지침묵) / phrases
- * 폰 브라우저에서 파이썬과 '동일한' 판단을 하도록 상수까지 미러링.
+/* walk_logic.js — 걸음지기 코어 로직 (모바일)
+ * geometry / risk(L1~L4) / scheduler / navigation / phrases
+ * v0.3 개선: ①가까운 것 우선 ②정차 vs 이동 차량 구분 ⑥인도/차도 분리(방향안내)
  * window.WalkLogic 로 노출.
  */
 (function (global) {
@@ -9,8 +9,7 @@
   // ---------------- geometry ----------------
   const NEAR = "NEAR", MID = "MID", FAR = "FAR";
   const LEFT = "LEFT", CENTER = "CENTER", RIGHT = "RIGHT";
-  // 폰 후면카메라는 장애물에 더 가깝게 잡히므로 파이썬(0.06)보다 밴드 임계값을 낮게.
-  let BAND_NEAR_RATIO = 0.045;
+  let BAND_NEAR_RATIO = 0.045;   // 화면의 4.5%↑ = 가까움 (폰 화각 기준, 현장보정)
   let BAND_MID_RATIO = 0.012;
   const ZONE_LEFT_MAX = 0.38, ZONE_RIGHT_MIN = 0.62;
 
@@ -32,30 +31,37 @@
     if (cx > ZONE_RIGHT_MIN) return RIGHT;
     return CENTER;
   }
-  function sideWord(zone) {
-    return zone === LEFT ? "왼쪽" : zone === RIGHT ? "오른쪽" : "앞";
-  }
+  function sideWord(zone) { return zone === LEFT ? "왼쪽" : zone === RIGHT ? "오른쪽" : "앞"; }
 
-  // 박스 면적의 시간적 증가율 → '접근 중'
-  class ApproachTracker {
-    constructor(history = 6, grow = 1.18) { this.h = history; this.g = grow; this.buf = new Map(); }
+  // 정차 vs 이동 판별기: 박스 면적 증가율(접근)과 중심 이동(횡단)을 함께 추적.
+  // ※ 카메라가 걷는 사람 몸에 있어 모든 것이 겉보기로 움직이므로, '빠른 증가'만
+  //   실제 이동 차량으로 간주(천천히 커지면 우리가 정차물에 다가가는 것으로 해석).
+  const GROW_FAST = 1.6, GROW_SLOW = 1.15, SHRINK = 0.9, LAT_MOVE = 0.10;
+  class MotionTracker {
+    constructor(history = 6) { this.h = history; this.buf = new Map(); }
     _key(det, zone) { return det.id != null ? "id:" + det.id : det.cls + ":" + zone; }
-    update(det, area, zone) {
+    update(det, area, cx, zone) {
       const k = this._key(det, zone);
       let b = this.buf.get(k); if (!b) { b = []; this.buf.set(k, b); }
-      b.push(area); if (b.length > this.h) b.shift();
-      if (b.length < Math.max(3, this.h >> 1)) return false;
-      const first = b[0] > 0 ? b[0] : 1e-9;
-      return (b[b.length - 1] / first) >= this.g;
+      b.push({ a: area, cx }); if (b.length > this.h) b.shift();
+      if (b.length < 3) return { state: "UNKNOWN", growth: 1, lateral: 0 };
+      const first = b[0], last = b[b.length - 1];
+      const growth = last.a / (first.a > 0 ? first.a : 1e-9);
+      const lateral = Math.abs(last.cx - first.cx);
+      let state;
+      if (growth >= GROW_FAST) state = "APPROACH_FAST";
+      else if (lateral >= LAT_MOVE) state = "CROSSING";
+      else if (growth >= GROW_SLOW) state = "APPROACH_SLOW";
+      else if (growth <= SHRINK) state = "RECEDING";
+      else state = "STATIONARY";
+      return { state, growth, lateral };
     }
   }
 
-  // 간이 IoU 트래커 → COCO-SSD 는 id 를 안 주므로 프레임간 매칭으로 id 부여(접근판정 안정화)
   function iou(a, b) {
     const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
     const x2 = Math.min(a[2], b[2]), y2 = Math.min(a[3], b[3]);
-    const iw = Math.max(0, x2 - x1), ih = Math.max(0, y2 - y1);
-    const inter = iw * ih;
+    const iw = Math.max(0, x2 - x1), ih = Math.max(0, y2 - y1), inter = iw * ih;
     const ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter;
     return ua > 0 ? inter / ua : 0;
   }
@@ -70,8 +76,7 @@
           const s = iou(d.xyxy, this.prev[i].xyxy);
           if (s >= best) { best = s; bi = i; }
         }
-        if (bi >= 0) { d.id = this.prev[bi].id; used.add(bi); }
-        else { d.id = this.next++; }
+        if (bi >= 0) { d.id = this.prev[bi].id; used.add(bi); } else { d.id = this.next++; }
       }
       this.prev = dets.map(d => ({ xyxy: d.xyxy, id: d.id }));
       return dets;
@@ -84,6 +89,8 @@
     moto_imminent: "정지, {side} 오토바이 접근",
     drop_imminent: "정지, 앞 낭떠러지",
     vehicle_caution: "{side} 차량 주의",
+    vehicle_moving: "{side} 차량 지나감",
+    vehicle_parked: "{side} 정차 차량",
     moto_caution: "{side} 오토바이 주의",
     obstacle_front: "앞 장애물",
     person_front: "앞 사람",
@@ -91,12 +98,12 @@
     curb_front: "앞 턱 주의",
     boundary_edge: "보도 끝 주의",
     construction_front: "앞 공사구간",
+    on_road: "차도입니다, 인도로",
     braille_guide: "{side} 점자블록",
     braille_on: "점자블록 위",
     crosswalk_front: "앞 횡단보도",
     signal_wait: "신호 대기",
     offpath_warn: "보행로를 벗어남",
-    // 내비게이션(방향 안내) — AI Guide Dog 논문의 전/좌/우 예측을 보행가능영역에서 유도
     nav_front: "직진",
     nav_left: "왼쪽으로",
     nav_right: "오른쪽으로",
@@ -109,17 +116,17 @@
   const VEHICLE = new Set(["car", "truck", "bus"]);
   const MOTO = new Set(["motorcycle", "bicycle"]);
   const PERSON = new Set(["person"]);
-  // COCO 정적 객체 중 보행 장애물로 취급할 것들(+ Cityscapes 'pole')
+  // 정적 장애물(전봇대/꼬깔콘/화분 등) — 중간거리에서도 잡음(인식률↑)
   const STATIC_OBST = new Set(["fire hydrant", "bench", "chair", "potted plant",
-    "parking meter", "stop sign", "suitcase", "backpack", "pole", "traffic light"]);
+    "parking meter", "stop sign", "suitcase", "backpack", "pole", "cone", "traffic cone"]);
 
-  function Hazard(level, kind, side, conf) {
+  function Hazard(level, kind, side, conf, prox) {
     return { level, kind, side: side || CENTER, conf: conf == null ? 1 : conf,
-             key: kind + ":" + (side || CENTER) };
+             prox: prox == null ? 0.5 : prox, key: kind + ":" + (side || CENTER) };
   }
 
   class WalkingRiskEngine {
-    constructor(confGate = 0.35) { this.confGate = confGate; this.tracker = new ApproachTracker(); }
+    constructor(confGate = 0.35) { this.confGate = confGate; this.motion = new MotionTracker(); }
     process(dets, env, W, H) {
       const hz = [];
       for (const d of dets) {
@@ -127,46 +134,54 @@
         const cls = d.cls, xyxy = d.xyxy;
         const zone = horizontalZone(xyxy, W);
         const band = proximityBand(xyxy, W, H);
-        const area = areaRatio(xyxy, W, H);
-        const approaching = this.tracker.update(d, area, zone);
+        const prox = areaRatio(xyxy, W, H);
+        const cx = (xyxy[0] + xyxy[2]) / 2 / W;
+        const m = this.motion.update(d, prox, cx, zone);
         const conf = d.conf == null ? 1 : d.conf;
 
         if (VEHICLE.has(cls) || MOTO.has(cls)) {
           const isMoto = MOTO.has(cls);
-          if (band === NEAR && (approaching || zone === CENTER)) {
-            hz.push(Hazard(L1, isMoto ? "moto_imminent" : "vehicle_imminent", zone, conf));
-          } else if (approaching || (band === MID && zone === CENTER)) {
-            hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_caution", zone, conf));
+          if (m.state === "APPROACH_FAST" && (band === NEAR || band === MID)) {
+            // 빠르게 다가오는(=움직이는) 차량 → 즉시 위험
+            hz.push(Hazard(L1, isMoto ? "moto_imminent" : "vehicle_imminent", zone, conf, prox));
+          } else if (m.state === "CROSSING" && (band === NEAR || band === MID)) {
+            hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_moving", zone, conf, prox));
+          } else if ((m.state === "APPROACH_SLOW" || m.state === "STATIONARY") && band === NEAR) {
+            // 안 움직이는 차 = 정차/주차 → 정면 근접 시 장애물성 안내
+            if (zone === CENTER) hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_parked", zone, conf, prox));
+          } else if (m.state === "UNKNOWN" && band === NEAR && zone === CENTER) {
+            hz.push(Hazard(L2, "vehicle_caution", zone, conf, prox));
           }
         } else if (PERSON.has(cls)) {
-          if (zone === CENTER && band === NEAR) hz.push(Hazard(L2, "person_front", zone, conf));
+          if (zone === CENTER && band === NEAR) hz.push(Hazard(L2, "person_front", zone, conf, prox));
         } else {
-          // 전방 근접한 정적 장애물(전봇대/벤치/화분/쓰레기통 등) → '앞 장애물'
+          // 정적 장애물: NEAR 는 물론, 알려진 정적 클래스는 MID 에서도 잡음(전봇대·꼬깔콘 인식률↑)
           if (zone === CENTER && (band === NEAR || (band === MID && STATIC_OBST.has(cls))))
-            hz.push(Hazard(L2, "obstacle_front", zone, conf));
+            hz.push(Hazard(L2, "obstacle_front", zone, conf, prox));
         }
       }
 
       if (env) {
-        if (env.drop === "front") hz.push(Hazard(L1, "drop_imminent", CENTER));
-        if (env.offpath) hz.push(Hazard(L2, "offpath_warn", CENTER));   // 보행로 벗어남
-        if (env.stairs === "front") hz.push(Hazard(L2, "stairs_front", CENTER));
-        if (env.curb === "front") hz.push(Hazard(L2, "curb_front", CENTER));
-        if (env.boundary) hz.push(Hazard(L2, "boundary_edge", CENTER));
-        if (env.construction === "front") hz.push(Hazard(L2, "construction_front", CENTER));
-        if (env.obstacle === "front") hz.push(Hazard(L2, "obstacle_front", CENTER)); // seg 장애물
-        if (env.braille === "left") hz.push(Hazard(L3, "braille_guide", LEFT));
-        else if (env.braille === "right") hz.push(Hazard(L3, "braille_guide", RIGHT));
-        else if (env.braille === "on") hz.push(Hazard(L3, "braille_on", CENTER));
-        if (env.crosswalk) hz.push(Hazard(L4, "crosswalk_front", CENTER));
-        if (env.signal_wait) hz.push(Hazard(L4, "signal_wait", CENTER));
+        if (env.drop === "front") hz.push(Hazard(L1, "drop_imminent", CENTER, 1, 0.95));
+        if (env.stairs === "front") hz.push(Hazard(L2, "stairs_front", CENTER, 1, 0.9));
+        if (env.curb === "front") hz.push(Hazard(L2, "curb_front", CENTER, 1, 0.9));
+        if (env.on_road) hz.push(Hazard(L2, "on_road", CENTER, 1, 0.85));
+        if (env.obstacle === "front") hz.push(Hazard(L2, "obstacle_front", CENTER, 1, 0.8));
+        if (env.boundary) hz.push(Hazard(L2, "boundary_edge", CENTER, 1, 0.55));
+        if (env.construction === "front") hz.push(Hazard(L2, "construction_front", CENTER, 1, 0.7));
+        if (env.braille === "left") hz.push(Hazard(L3, "braille_guide", LEFT, 1, 0.5));
+        else if (env.braille === "right") hz.push(Hazard(L3, "braille_guide", RIGHT, 1, 0.5));
+        else if (env.braille === "on") hz.push(Hazard(L3, "braille_on", CENTER, 1, 0.5));
+        if (env.crosswalk) hz.push(Hazard(L4, "crosswalk_front", CENTER, 1, 0.4));
+        if (env.signal_wait) hz.push(Hazard(L4, "signal_wait", CENTER, 1, 0.3));
       }
-      hz.sort((a, b) => a.level - b.level || b.conf - a.conf);
+      // 같은 등급이면 '가까운 것(prox 큰 것)' 먼저
+      hz.sort((a, b) => a.level - b.level || b.prox - a.prox);
       return hz;
     }
   }
 
-  // ---------------- scheduler (피로 방지) ----------------
+  // ---------------- scheduler ----------------
   const PERSIST = { 1: 1, 2: 3, 3: 4, 4: 5 };
   const COOLDOWN = { 1: 1.2, 2: 3.0, 3: 6.0, 4: 8.0 };
   const RATE_WINDOW = 4.0, RATE_MAX_LOW = 2;
@@ -179,28 +194,23 @@
         seen.add(h.key);
         this.persist.set(h.key, (this.persist.get(h.key) || 0) + 1);
         const ex = byKey.get(h.key);
-        if (!ex || h.level < ex.level) byKey.set(h.key, h);
+        if (!ex || h.level < ex.level || (h.level === ex.level && h.prox > ex.prox)) byKey.set(h.key, h);
       }
       for (const k of this.persist.keys()) if (!seen.has(k)) this.persist.set(k, 0);
 
       const active = [];
       for (const [k, h] of byKey) if ((this.persist.get(k) || 0) >= (PERSIST[h.level] || 3)) active.push(h);
       if (!active.length) return [];
-      active.sort((a, b) => a.level - b.level || b.conf - a.conf);
+      active.sort((a, b) => a.level - b.level || b.prox - a.prox);   // 가까운 것 먼저
 
-      // 인터럽트: L1 활성이면 하위 완전 억제
       const l1 = active.find(h => h.level === 1);
       if (l1) return this._cooldownOk(l1, t) ? [this._emit(l1, t)] : [];
 
       for (const h of active) {
-        if (h.level >= 4 && !moving) continue;            // 정지 중 참고정보 침묵
-        if (!this._cooldownOk(h, t)) continue;            // 중복 방지
-        if (h.level >= 3) {                                // L3/L4 레이트리밋
-          this._pruneLow(t);
-          if (this.lowEmits.length >= RATE_MAX_LOW) continue;
-          this.lowEmits.push(t);
-        }
-        return [this._emit(h, t)];                         // 한 tick 한 마디
+        if (h.level >= 4 && !moving) continue;
+        if (!this._cooldownOk(h, t)) continue;
+        if (h.level >= 3) { this._pruneLow(t); if (this.lowEmits.length >= RATE_MAX_LOW) continue; this.lowEmits.push(t); }
+        return [this._emit(h, t)];
       }
       return [];
     }
@@ -209,17 +219,10 @@
     _pruneLow(t) { while (this.lowEmits.length && (t - this.lowEmits[0]) > RATE_WINDOW) this.lowEmits.shift(); }
   }
 
-  // ---------------- navigation (방향 안내) ----------------
-  // AI Guide Dog(2501.07957)의 전/좌/우 경로 예측을 '보행가능영역 방향'에서 유도.
-  // 안내 규칙: ①방향이 바뀔 때만 말함(연속 잔소리 금지) ②히스테리시스로 흔들림 억제
-  //           ③위험 경고(L1/L2)가 있으면 침묵(안전 우선) ④정지 중엔 STOP 외 침묵
-  const NAV_PERSIST = 4;      // 방향 확정에 필요한 연속 프레임 (~2s @ 2fps)
-  const NAV_REMIND = 9.0;     // 같은 방향 유지 시 재안내 간격(초)
-  const NAV_COOLDOWN = 2.5;   // 최소 발화 간격(초)
-
+  // ---------------- navigation ----------------
+  const NAV_PERSIST = 4, NAV_REMIND = 9.0, NAV_COOLDOWN = 2.5;
   class NavigationGuide {
     constructor() { this.stable = null; this.cand = null; this.candCnt = 0; this.lastSpoke = -1e9; }
-    // dir: "FRONT"|"LEFT"|"RIGHT"|"STOP"|null,  opts:{moving, hazardActive}
     update(dir, t, opts) {
       opts = opts || {};
       if (dir == null) return null;
@@ -227,10 +230,8 @@
       let changed = false;
       if (this.candCnt >= NAV_PERSIST && dir !== this.stable) { this.stable = dir; changed = true; }
       if (this.stable == null) return null;
-      if (opts.hazardActive) return null;                        // 위험 우선 → 내비 침묵
-      if (!opts.moving && this.stable !== "STOP") return null;    // 정지 중 방향안내 억제
-      // 방향 전환(changed)은 히스테리시스가 이미 걸러주므로 즉시 안내(쿨다운 우회).
-      // 같은 방향 유지 재안내(due)만 쿨다운/재안내 간격 적용.
+      if (opts.hazardActive) return null;
+      if (!opts.moving && this.stable !== "STOP") return null;
       const due = (t - this.lastSpoke) >= NAV_REMIND;
       if (changed || (due && (t - this.lastSpoke) >= NAV_COOLDOWN)) {
         this.lastSpoke = t;
@@ -240,57 +241,57 @@
       return null;
     }
   }
-
-  // 보행가능영역 요약(walkFrac, 중심 cx) → 방향(FRONT/LEFT/RIGHT/STOP)
-  function walkDirection(walkFrac, cx) {
-    if (walkFrac < 0.22) return "STOP";        // 전방 경로 대부분 막힘/끝
+  // 인도(sidewalk) 비율 + 중심 → 방향. 인도가 거의 없으면 STOP(막힘/차도).
+  function walkDirection(pedFrac, cx) {
+    if (pedFrac < 0.20) return "STOP";
     if (cx < 0.42) return "LEFT";
     if (cx > 0.58) return "RIGHT";
     return "FRONT";
   }
 
-  // ---------------- self-test (파이썬 테스트 미러) ----------------
+  // ---------------- self-test ----------------
   function selfTest() {
     const W = 1280, H = 720;
     const box = (cxf, size) => { const cx = cxf*W, cy = 0.6*H, half = size*Math.min(W,H)/2; return [cx-half, cy-half, cx+half, cy+half]; };
     const run = (seq, movingSeq) => {
       const eng = new WalkingRiskEngine(), sch = new AlertScheduler(), out = [];
-      seq.forEach(([dets, env], i) => {
-        const t = i/10, moving = movingSeq ? movingSeq[i] : true;
-        for (const a of sch.feed(eng.process(dets, env, W, H), t, moving)) out.push([+t.toFixed(2), a.level, a.text]);
-      });
-      return out;
-    };
-    const results = [];
-    // L1 인터럽트 — L4 억제
-    let o = run(Array(6).fill([[{cls:"car",conf:.9,id:1,xyxy:box(0.5,0.45)}], {crosswalk:true}]));
-    results.push(["L1 인터럽트", o.some(r=>r[1]===1) && !o.some(r=>r[1]===4), o]);
-    // 정지 침묵
-    o = run(Array(10).fill([[], {crosswalk:true}]), Array(10).fill(false));
-    results.push(["정지 침묵 L4", o.length===0, o]);
-    // 쿨다운 1회
-    o = run(Array(20).fill([[{cls:"chair",conf:.9,id:3,xyxy:box(0.5,0.45)}], null]));
-    results.push(["쿨다운 1회", o.filter(r=>r[1]===2).length===1, o]);
-    return results;
-  }
-
-  function selfTestNav() {
-    const runNav = (dirs, opts) => {
-      const g = new NavigationGuide(), out = [];
-      dirs.forEach((d, i) => { const a = g.update(d, i / 2, opts ? opts[i] : { moving: true }); if (a) out.push([i, a.text]); });
+      seq.forEach(([dets, env], i) => { const t = i/10, moving = movingSeq ? movingSeq[i] : true;
+        for (const a of sch.feed(eng.process(dets, env, W, H), t, moving)) out.push([+t.toFixed(2), a.level, a.text]); });
       return out;
     };
     const R = [];
-    // 방향 변경 시에만 안내: FRONT 확정 → RIGHT 확정 → 두 번만
+    // ① 접근(커지는) 차량 → L1, 횡단보도 L4 억제
+    let seq = []; for (let i = 0; i < 6; i++) seq.push([[{cls:"car",conf:.9,id:1,xyxy:box(0.5,0.30+i*0.06)}], {crosswalk:true}]);
+    let o = run(seq);
+    R.push(["접근차량 L1 인터럽트", o.some(r=>r[1]===1 && r[2].includes("접근")) && !o.some(r=>r[1]===4), o]);
+    // ② 정차(안 커지는) 차량 → '정차 차량'(접근 아님)
+    seq = []; for (let i = 0; i < 8; i++) seq.push([[{cls:"car",conf:.9,id:2,xyxy:box(0.5,0.5)}], null]);
+    o = run(seq);
+    R.push(["정차/이동 구분", o.some(r=>r[2].includes("정차")) && !o.some(r=>r[2].includes("접근")), o]);
+    // ① 가까운 것 먼저: 큰 의자(가까움) vs 사람 → 의자 먼저
+    seq = []; for (let i = 0; i < 5; i++) seq.push([[{cls:"chair",conf:.9,id:3,xyxy:box(0.5,0.5)},{cls:"person",conf:.9,id:4,xyxy:box(0.5,0.30)}], null]);
+    o = run(seq);
+    R.push(["가까운 것 먼저", o.length>0 && o[0][2].includes("장애물"), o]);
+    // 쿨다운 1회
+    seq = []; for (let i = 0; i < 20; i++) seq.push([[{cls:"chair",conf:.9,id:5,xyxy:box(0.5,0.5)}], null]);
+    o = run(seq);
+    R.push(["쿨다운 1회", o.filter(r=>r[1]===2).length===1, o]);
+    // 정지 침묵 L4
+    o = run(Array(10).fill([[], {crosswalk:true}]), Array(10).fill(false));
+    R.push(["정지 침묵 L4", o.length===0, o]);
+    return R;
+  }
+
+  function selfTestNav() {
+    const runNav = (dirs, opts) => { const g = new NavigationGuide(), out = [];
+      dirs.forEach((d, i) => { const a = g.update(d, i/2, opts ? opts[i] : { moving: true }); if (a) out.push([i, a.text]); }); return out; };
+    const R = [];
     let o = runNav(["FRONT","FRONT","FRONT","FRONT","RIGHT","RIGHT","RIGHT","RIGHT"]);
     R.push(["변경시 안내", o.length === 2 && o[0][1] === "직진" && o[1][1] === "오른쪽으로", o]);
-    // 흔들림(FRONT/RIGHT 교대) → 확정 안 됨 → 발화 0
     o = runNav(["FRONT","RIGHT","FRONT","RIGHT","FRONT","RIGHT","FRONT","RIGHT"]);
     R.push(["히스테리시스 흔들림 억제", o.length === 0, o]);
-    // 위험 중이면 내비 침묵
     o = runNav(Array(8).fill("LEFT"), Array(8).fill({ moving: true, hazardActive: true }));
     R.push(["위험 중 내비 침묵", o.length === 0, o]);
-    // STOP 은 정지 중에도 안내
     o = runNav(Array(8).fill("STOP"), Array(8).fill({ moving: false }));
     R.push(["길막힘 정지안내", o.some(x => x[1].includes("막힘")), o]);
     return R;
@@ -299,8 +300,7 @@
   global.WalkLogic = {
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
-    Tracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection,
-    render, selfTest, selfTestNav,
-    STATIC_OBST, VEHICLE, MOTO, PERSON,
+    Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection,
+    render, selfTest, selfTestNav, STATIC_OBST, VEHICLE, MOTO, PERSON,
   };
 })(typeof window !== "undefined" ? window : globalThis);

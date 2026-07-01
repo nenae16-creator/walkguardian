@@ -47,6 +47,7 @@
       <button data-mode="seg">정밀 보행로</button>
     </div>
     <button id="navBtn">내비 OFF</button>
+    <button id="sound">🔊 소리</button>
     <button id="videoBtn">동영상</button>
     <input id="videoFile" type="file" accept="video/*" style="display:none">
     <button id="test">자가검사</button>
@@ -90,6 +91,27 @@ function estimateMoving(){
   return (diff/(32*24)) > 6;      // 경험적 임계값
 }
 
+// ---- 계단/턱 휴리스틱(실험): 전방 하단의 강한 수평 에지 ----
+// 계단=규칙적 수평선 다수, 턱=하단 뚜렷한 단일 수평에지. 깊이센서 없이 근사 → 오탐 가능(보수적 임계).
+const stepCv = document.createElement("canvas"); stepCv.width=48; stepCv.height=48;
+const sctx = stepCv.getContext("2d",{willReadFrequently:true});
+function detectSteps(){
+  const W=video.videoWidth, H=video.videoHeight; if(!W) return {};
+  sctx.drawImage(video, W*0.30, H*0.55, W*0.40, H*0.45, 0,0,48,48);  // 발 앞 하단-중앙
+  const d=sctx.getImageData(0,0,48,48).data;
+  const g=(y,x)=>{ const i=(y*48+x)*4; return d[i]*0.3+d[i+1]*0.59+d[i+2]*0.11; };
+  const rows=[];
+  for(let y=0;y<47;y++){ let s=0; for(let x=0;x<48;x++) s+=Math.abs(g(y,x)-g(y+1,x)); rows.push(s/48); }
+  const mx=Math.max.apply(null,rows)||1;
+  let peaks=0, lastY=-5;
+  for(let y=1;y<rows.length-1;y++)
+    if(rows[y]>0.35*mx && rows[y]>=rows[y-1] && rows[y]>rows[y+1] && (y-lastY)>=3){ peaks++; lastY=y; }
+  const env={};
+  if(peaks>=3) env.stairs="front";                 // 규칙적 수평선 다수 → 계단
+  else if(peaks>=1 && mx>18) env.curb="front";     // 강한 단일 수평에지 → 턱(보수적)
+  return env;
+}
+
 // ---------------- 음성 (Web Speech, 한국어, 오프라인) ----------------
 let koVoice = null;
 function pickVoice(){
@@ -97,18 +119,39 @@ function pickVoice(){
   koVoice = vs.find(v=>/ko(-|_)?KR/i.test(v.lang)) || vs.find(v=>/korean|한국/i.test(v.name)) || null;
 }
 if("speechSynthesis" in window){ speechSynthesis.onvoiceschanged = pickVoice; pickVoice(); }
-let speaking = false;
-function speak(alert){
-  const t = alert.text;
-  if(!("speechSynthesis" in window)) return;
-  if(alert.level===1) speechSynthesis.cancel();       // 즉시위험은 현재 발화 끊고 우선
-  else if(speaking || speechSynthesis.speaking) return; // 채널 하나: 말하는 중이면 하위는 skip
-  const u = new SpeechSynthesisUtterance(t);
-  u.lang="ko-KR"; if(koVoice) u.voice=koVoice; u.rate=1.15; u.pitch=1;
-  u.onstart=()=>speaking=true; u.onend=()=>speaking=false; u.onerror=()=>speaking=false;
-  speechSynthesis.speak(u);
+// 경보음(WebAudio) — 음성 합성이 안 되는 폰에서도 최소한의 청각 신호
+let audioCtx=null;
+function beep(freq,ms,vol){
+  try{
+    audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==="suspended") audioCtx.resume();
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type="square"; o.frequency.value=freq; g.gain.value=vol||0.12;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime+(ms||150)/1000);
+  }catch(e){}
 }
-function vibrate(level){ if(navigator.vibrate){ navigator.vibrate(level===1?[120,60,120]:[80]); } }
+let lastUtterStart=0;
+function speak(alert){
+  if(!("speechSynthesis" in window)){ beep(alert.level===1?900:520,180); return; }
+  try{ speechSynthesis.resume(); }catch(e){}                 // 모바일 일시정지 버그 복구
+  const now=performance.now();
+  if(speechSynthesis.speaking && (now-lastUtterStart)>4000) speechSynthesis.cancel();  // 워치독
+  if(alert.level===1){ speechSynthesis.cancel(); beep(900,120,0.18); }   // 즉시위험: 끊고 우선 + 경보음
+  else if(speechSynthesis.speaking) return;                              // 채널 하나
+  if(!koVoice) pickVoice();
+  const u=new SpeechSynthesisUtterance(alert.text);
+  u.lang="ko-KR"; if(koVoice) u.voice=koVoice; u.rate=1.15;
+  u.onstart=()=>{ lastUtterStart=performance.now(); };
+  u.onerror=()=>{ beep(alert.level===1?900:520,150); };      // 합성 실패 시 소리로라도
+  lastUtterStart=now; speechSynthesis.speak(u);
+}
+function vibrate(level){ if(navigator.vibrate){ navigator.vibrate(level===1?[120,60,120]:[70]); } }
+function ttsStatus(){
+  const vs=("speechSynthesis"in window)?speechSynthesis.getVoices():[];
+  const ko=vs.find(v=>/ko(-|_)?KR/i.test(v.lang))||vs.find(v=>/korean|한국/i.test(v.name));
+  return ko?("음성 "+ko.name):"한국어 음성 없음 → 경보음 사용";
+}
 
 function showCaption(alert){
   // 내비게이션(방향)은 파란색으로 위험 경고와 구분
@@ -128,9 +171,11 @@ function cocoToDets(preds){
 }
 
 // ---------------- DeepLab(Cityscapes) 분석: 보행로 + 전봇대/차/사람 + 침범물 ----------------
-const WALKABLE = new Set(["road","sidewalk","terrain"]);
+const GROUND = new Set(["road","sidewalk","terrain"]);   // 걸을 수 있는 '바닥'(장애물 판정용)
+const PED    = new Set(["sidewalk","terrain"]);          // 보행자 우선 '인도'(방향 안내용)
 const SEG_OBST = {pole:"pole", person:"person", car:"car", truck:"truck",
-  bus:"bus", motorcycle:"motorcycle", bicycle:"bicycle", rider:"person"};
+  bus:"bus", motorcycle:"motorcycle", bicycle:"bicycle", rider:"person",
+  "traffic sign":"pole", fence:"pole"};   // 표지판·펜스도 기둥성 장애물로(꼬깔콘·기둥 인식률↑)
 let colorToClass = null;
 function buildColorMap(legend){
   colorToClass={};
@@ -145,8 +190,8 @@ function analyzeSeg(res, W, H){
   const {width:sw, height:sh, segmentationMap:map}=res; // map: Uint8, 채널수 실측
   const ch=Math.max(3, Math.round(map.length/(sw*sh))); // RGB(3) 또는 RGBA(4) 대응
   const cor=corridor(1,1); // 정규화 코리도
-  let corTot=0, corWalk=0;
-  let navTot=0, navWalk=0, navSumX=0;  // 방향안내용 전방 보행영역 분포
+  let corTot=0, corGround=0, corPed=0, corRoad=0;
+  let navTot=0, navPed=0, navSumX=0;   // 방향안내용: 인도(sidewalk) 분포
   const boxes={}; // class -> [minx,miny,maxx,maxy] (정규화)
   const step=2;
   for(let yy=0; yy<sh; yy+=step){
@@ -158,11 +203,14 @@ function analyzeSeg(res, W, H){
       const nx=xx/sw;
       // 코리도(전방 경로) 내부인가
       if(nx>=cor.x1 && nx<=cor.x2 && ny>=cor.y1){
-        corTot++; if(WALKABLE.has(cls)) corWalk++;
+        corTot++;
+        if(GROUND.has(cls)) corGround++;
+        if(cls==="sidewalk"||cls==="terrain") corPed++;
+        if(cls==="road") corRoad++;
       }
-      // 방향안내용 전방 넓은 밴드(보도가 어디로 이어지나)
+      // 방향안내용 전방 넓은 밴드 — '인도'가 어디로 이어지나
       if(nx>=0.15 && nx<=0.85 && ny>=0.5){
-        navTot++; if(WALKABLE.has(cls)){ navWalk++; navSumX+=nx; }
+        navTot++; if(PED.has(cls)){ navPed++; navSumX+=nx; }
       }
       // 장애물 클래스 bbox 누적(전체 프레임)
       const oc=SEG_OBST[cls];
@@ -175,13 +223,16 @@ function analyzeSeg(res, W, H){
     dets.push({cls:oc, conf:0.7, xyxy:[b[0]*W,b[1]*H,b[2]*W,b[3]*H]}); }
   tracker.update(dets);
   const env={};
-  const walkFrac = corTot? corWalk/corTot : 0;
-  if(corTot>20 && walkFrac<0.35) env.obstacle="front";  // 전방 경로가 대부분 보행불가 → 장애물/차단
-  else if(corTot>20 && walkFrac<0.6) env.boundary=true;  // 경로 절반 이하 보행가능 → 보도 끝/벗어남
-  // 내비게이션 방향: 보행영역 비율 + 중심 x → FRONT/LEFT/RIGHT/STOP
-  const navFrac = navTot? navWalk/navTot : 0;
-  const navCx = navWalk? navSumX/navWalk : 0.5;
-  const nav = { dir: L.walkDirection(navFrac, navCx), frac:navFrac, cx:navCx };
+  const groundFrac = corTot? corGround/corTot : 0;   // 코리도 바닥(인도+차도+흙) 비율
+  const pedFracCor = corTot? corPed/corTot : 0;       // 코리도 인도 비율
+  const roadFracCor = corTot? corRoad/corTot : 0;     // 코리도 차도 비율
+  if(corTot>20 && groundFrac<0.45) env.obstacle="front";       // 바닥이 물체로 막힘 → 장애물(전봇대/꼬깔콘 등)
+  else if(corTot>20 && roadFracCor>0.5 && pedFracCor<0.15) env.on_road="front"; // 앞이 차도 → 인도로
+  else if(corTot>20 && pedFracCor<0.35 && roadFracCor<0.3) env.boundary=true;   // 인도 끝/벗어남
+  // 방향 안내: '인도(sidewalk)' 분포로 FRONT/LEFT/RIGHT/STOP (차도는 보행경로에서 제외)
+  const navPedFrac = navTot? navPed/navTot : 0;
+  const navCx = navPed? navSumX/navPed : 0.5;
+  const nav = { dir: L.walkDirection(navPedFrac, navCx), frac:navPedFrac, cx:navCx };
   return {dets, env, nav};
 }
 
@@ -209,13 +260,14 @@ async function loop(){
   if(W&&H){
     const t=performance.now()/1000;
     const moving=estimateMoving();
-    let dets=[], env=null, nav=null;
+    let dets=[], env={}, nav=null;
+    Object.assign(env, detectSteps());   // 계단/턱 (양 모드 공통, raw 프레임)
     try{
       if(mode==="coco" && cocoModel){
         dets = cocoToDets(await cocoModel.detect(video, 20));
       } else if(mode==="seg" && segModel){
         const res = await segModel.segment(video);
-        const a = analyzeSeg(res, W, H); dets=a.dets; env=a.env; nav=a.nav;
+        const a = analyzeSeg(res, W, H); dets=a.dets; Object.assign(env, a.env); nav=a.nav;
       }
     }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
     const hazards = engine.process(dets, env, W, H);
@@ -235,8 +287,9 @@ async function loop(){
 }
 
 // ---------------- 시작/정지/모드 ----------------
-function primeVoice(){ // iOS 음성 잠금 해제 (사용자 제스처 안 1회 발화)
-  if("speechSynthesis" in window){ const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
+function primeVoice(){ // iOS 음성/오디오 잠금 해제 (사용자 제스처 안 1회)
+  beep(660,60,0.05);
+  if("speechSynthesis" in window){ if(!koVoice) pickVoice(); const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
 }
 async function ensureModel(){
   statusEl.textContent="모델 로딩…";
@@ -282,6 +335,12 @@ $("#navBtn").onclick=()=>{
 };
 $("#videoBtn").onclick=()=>$("#videoFile").click();
 $("#videoFile").onchange=e=>{ const f=e.target.files[0]; if(f) startVideo(f); };
+$("#sound").onclick=()=>{   // 소리 테스트 + iOS 오디오 잠금 해제
+  if(!koVoice) pickVoice();
+  beep(660,120,0.12);
+  speak({level:3, text:"소리 테스트, 걸음지기입니다"});
+  statusEl.textContent="소리 테스트 — "+ttsStatus();
+};
 $("#modeSeg").onclick=async e=>{
   const b=e.target.closest("button[data-mode]"); if(!b) return;
   [...$("#modeSeg").children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
@@ -300,6 +359,11 @@ $("#test").onclick=()=>{
   console.log("selfTest", r);
 };
 window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav()];   // 자동 검증용
+
+// 로딩 시 음성 가용 여부 표기(voiceschanged 후 갱신)
+function refreshVoiceStatus(){ if(!running) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }
+if("speechSynthesis" in window) speechSynthesis.addEventListener("voiceschanged", ()=>{ pickVoice(); refreshVoiceStatus(); });
+refreshVoiceStatus();
 </script>
 </body>
 </html>
