@@ -417,6 +417,34 @@
     }
   }
 
+  // data.go.kr CSV 헤더 → 위도/경도/음향신호기 컬럼 자동 탐지
+  function detectPoiColumns(headers) {
+    const idx = re => headers.findIndex(h => re.test(String(h).trim()));
+    return {
+      lat: idx(/위도|latitude|^lat$|y좌표|위도값/i),
+      lon: idx(/경도|longitude|^lon$|^lng$|x좌표|경도값/i),
+      acoustic: idx(/음향신호기.*여부|음향신호기\s*설치|음향신호기$|acoustic/i),
+    };
+  }
+  // 파싱된 헤더/행 → POI 배열 (한국 범위 밖·투영좌표·오류행 제외)
+  function rowsToPOIs(headers, rows) {
+    const c = detectPoiColumns(headers), out = [];
+    if (c.lat < 0 || c.lon < 0) return { pois: out, cols: c, error: "위도/경도 컬럼을 찾지 못함" };
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const lat = parseFloat(r[c.lat]), lon = parseFloat(r[c.lon]);
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      if (lat < 33 || lat > 39 || lon < 124 || lon > 132) continue;   // 한국(WGS84) 밖·투영좌표 제외
+      let kind = "acoustic_signal";
+      if (c.acoustic >= 0) {
+        const v = String(r[c.acoustic] == null ? "" : r[c.acoustic]).trim();
+        kind = /^(y|1|유|설치|있|o|true)/i.test(v) ? "acoustic_signal" : "crosswalk_front";
+      }
+      out.push({ id: "csv_" + i, kind, lat, lon });
+    }
+    return { pois: out, cols: c };
+  }
+
   function selfTestGeo() {
     const R = [];
     const near111 = haversine(37.5000, 127.0000, 37.5010, 127.0000); // 0.001° 위도 ≈ 111m
@@ -436,11 +464,22 @@
     return R;
   }
 
+  function selfTestCSV() {
+    const headers = ["관리번호", "위도", "경도", "음향신호기설치여부"];
+    const rows = [["1", "37.5", "127.0", "Y"], ["2", "37.6", "127.1", "N"],
+                  ["3", "bad", "x", "Y"], ["4", "10.0", "50.0", "Y"]];
+    const { pois } = rowsToPOIs(headers, rows);
+    return [
+      ["CSV 위경도·종류 매핑", pois.length === 2 && pois[0].kind === "acoustic_signal" && pois[1].kind === "crosswalk_front", pois],
+      ["오류행·한국밖 제외", pois.length === 2, pois.length],
+    ];
+  }
+
   global.WalkLogic = {
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
-    geo: { haversine, bearing, relSide, checkPOIs, sideWord },
+    geo: { haversine, bearing, relSide, checkPOIs, sideWord, detectPoiColumns, rowsToPOIs },
     Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth, POIAnnouncer,
-    render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
+    render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, selfTestCSV, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
   };
 })(typeof window !== "undefined" ? window : globalThis);

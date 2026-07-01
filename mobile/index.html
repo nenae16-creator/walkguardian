@@ -50,6 +50,8 @@
     <button id="navBtn">내비 OFF</button>
     <button id="geoBtn">위치안내 OFF</button>
     <button id="poiAdd">여기 지점</button>
+    <button id="poiLoad">POI불러오기</button>
+    <input id="poiFile" type="file" accept=".csv,.json,text/csv" style="display:none">
     <button id="depthBtn">깊이(실험)</button>
     <button id="sound">🔊 소리</button>
     <button id="videoBtn">동영상</button>
@@ -504,12 +506,42 @@ function addTestPOI(kind){
   poiList.push({id:"test_"+Date.now().toString().slice(-5), kind, lat:lastGeo.lat, lon:lastGeo.lon});
   statusEl.textContent="여기에 음향신호기 테스트 지점 추가 — 20~30m 멀어졌다 다시 오면 안내됩니다";
 }
+// data.go.kr CSV(전국신호등표준데이터/음향신호기 현황) 또는 JSON 불러오기 (한글 CP949 자동)
+function parseCSV(text){
+  const lines=text.split(/\r?\n/).filter(l=>l.trim().length);
+  const pl=line=>{ const out=[]; let cur="", q=false;
+    for(let i=0;i<line.length;i++){ const ch=line[i];
+      if(q){ if(ch==='"'){ if(line[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=ch; }
+      else { if(ch==='"') q=true; else if(ch===',' ){ out.push(cur); cur=""; } else cur+=ch; } }
+    out.push(cur); return out; };
+  const rows=lines.map(pl);
+  return { headers: rows[0]||[], rows: rows.slice(1) };
+}
+async function loadPOIFile(file){
+  const buf=await file.arrayBuffer();
+  let text=new TextDecoder("utf-8",{fatal:false}).decode(buf);
+  if((text.match(/�/g)||[]).length>5){ try{ text=new TextDecoder("euc-kr").decode(buf); }catch(e){} } // CP949 폴백
+  let added=0;
+  if(/^\s*[\[{]/.test(text)){
+    try{ const arr=JSON.parse(text); if(Array.isArray(arr)){ poiList.push(...arr); added=arr.length; } }
+    catch(e){ statusEl.textContent="JSON 파싱 오류: "+e.message; return; }
+  } else {
+    const { headers, rows }=parseCSV(text);
+    const { pois, error }=L.geo.rowsToPOIs(headers, rows);
+    if(error){ statusEl.textContent="CSV: "+error+" (헤더에 '위도'·'경도' 필요)"; return; }
+    poiList.push(...pois); added=pois.length;
+  }
+  poiAnnouncer.inside=new Set();
+  statusEl.textContent="POI "+added+"개 불러옴 (총 "+poiList.length+"개) — '위치안내 ON'으로 사용";
+}
 
 $("#start").onclick=start; $("#stopb").onclick=stop;
 $("#depthBtn").onclick=startDepth;
 $("#xrEnd").onclick=()=>{ if(xrSession) try{ xrSession.end(); }catch(e){} };
 $("#geoBtn").onclick=()=>{ if(geoOn) stopGeo(); else startGeo(); };
 $("#poiAdd").onclick=()=>addTestPOI("acoustic_signal");
+$("#poiLoad").onclick=()=>$("#poiFile").click();
+$("#poiFile").onchange=e=>{ const f=e.target.files[0]; if(f) loadPOIFile(f); };
 $("#navBtn").onclick=()=>{
   navOn=!navOn; $("#navBtn").textContent="내비 "+(navOn?"ON":"OFF");
   $("#navBtn").style.background=navOn?"#1e7a3a":"#1c2a55";
@@ -546,7 +578,7 @@ $("#test").onclick=()=>{
   statusEl.textContent="자가검사 "+r.filter(x=>x[1]).length+"/"+r.length+(ok?" 통과":" 실패");
   console.log("selfTest", r);
 };
-window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth(), ...L.selfTestGeo()];   // 자동 검증용
+window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth(), ...L.selfTestGeo(), ...L.selfTestCSV()];   // 자동 검증용
 
 // 로딩 시 음성 가용 여부 표기(voiceschanged 후 갱신)
 function refreshVoiceStatus(){ if(!running && !xrSession) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }
