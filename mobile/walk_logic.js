@@ -111,6 +111,14 @@
   };
   function render(kind, side) { return (PHRASES[kind] || kind).replace("{side}", side || "앞"); }
 
+  // '위험요소만' 모드에서 말하는 종류(=실제 위험). 길안내/참고/부정확한 것은 제외.
+  const DANGER_KINDS = new Set([
+    "vehicle_imminent", "moto_imminent", "drop_imminent",
+    "vehicle_caution", "vehicle_moving", "vehicle_parked", "moto_caution",
+    "obstacle_front", "person_front", "construction_front", "on_road",
+  ]);
+  // 제외(위험만 모드): braille_*, crosswalk, signal, boundary, stairs, curb, nav_*
+
   // ---------------- risk (L1~L4) ----------------
   const L1 = 1, L2 = 2, L3 = 3, L4 = 4;
   const VEHICLE = new Set(["car", "truck", "bus"]);
@@ -301,6 +309,6 @@
     geometry: { areaRatio, proximityBand, horizontalZone, sideWord, NEAR, MID, FAR, LEFT, CENTER, RIGHT,
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
     Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection,
-    render, selfTest, selfTestNav, STATIC_OBST, VEHICLE, MOTO, PERSON,
+    render, selfTest, selfTestNav, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
   };
 })(typeof window !== "undefined" ? window : globalThis);

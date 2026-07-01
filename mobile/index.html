@@ -46,6 +46,7 @@
       <button data-mode="coco" class="on">빠름</button>
       <button data-mode="seg">정밀 보행로</button>
     </div>
+    <button id="dangerBtn" style="background:#7a2030">위험만</button>
     <button id="navBtn">내비 OFF</button>
     <button id="sound">🔊 소리</button>
     <button id="videoBtn">동영상</button>
@@ -69,6 +70,7 @@ const scheduler = new L.AlertScheduler();
 const tracker = new L.Tracker();
 const navGuide = new L.NavigationGuide();
 let navOn = false;
+let dangerOnly = true;   // 기본: 위험요소만 (길안내·참고·부정확한 계단 등 억제)
 
 let mode = "coco";            // coco | seg
 let cocoModel = null, segModel = null;
@@ -131,8 +133,24 @@ function beep(freq,ms,vol){
     o.start(); o.stop(audioCtx.currentTime+(ms||150)/1000);
   }catch(e){}
 }
+// ---- 미리 만든 한국어 음성 클립(폰에 한국어 TTS 없어도 한국어로 재생) ----
+let clipMap = {}, curClip = null, clipsReady = false;
+(async function loadClips(){
+  try{ const m = await (await fetch("clips.json")).json();
+    for(const t in m){ const a=new Audio(m[t]); a.preload="auto"; clipMap[t]=a; }
+    clipsReady = Object.keys(clipMap).length>0;
+  }catch(e){}
+})();
+function playClip(alert){
+  const a = clipMap[alert.text]; if(!a) return false;
+  if(alert.level===1){ if(curClip && !curClip.paused){ curClip.pause(); curClip.currentTime=0; } }
+  else if(curClip && !curClip.paused && !curClip.ended) return true;   // 채널 사용중 → 하위 skip
+  try{ a.currentTime=0; const p=a.play(); if(p&&p.catch) p.catch(()=>beep(alert.level===1?900:520,150)); curClip=a; return true; }
+  catch(e){ return false; }
+}
 let lastUtterStart=0;
 function speak(alert){
+  if(playClip(alert)) return;                                // 1순위: 미리 만든 한국어 클립
   if(!("speechSynthesis" in window)){ beep(alert.level===1?900:520,180); return; }
   try{ speechSynthesis.resume(); }catch(e){}                 // 모바일 일시정지 버그 복구
   const now=performance.now();
@@ -148,9 +166,10 @@ function speak(alert){
 }
 function vibrate(level){ if(navigator.vibrate){ navigator.vibrate(level===1?[120,60,120]:[70]); } }
 function ttsStatus(){
+  if(clipsReady) return "한국어 음성파일 준비됨";
   const vs=("speechSynthesis"in window)?speechSynthesis.getVoices():[];
   const ko=vs.find(v=>/ko(-|_)?KR/i.test(v.lang))||vs.find(v=>/korean|한국/i.test(v.name));
-  return ko?("음성 "+ko.name):"한국어 음성 없음 → 경보음 사용";
+  return ko?("기기음성 "+ko.name):"음성파일 로딩중…";
 }
 
 function showCaption(alert){
@@ -261,7 +280,7 @@ async function loop(){
     const t=performance.now()/1000;
     const moving=estimateMoving();
     let dets=[], env={}, nav=null;
-    Object.assign(env, detectSteps());   // 계단/턱 (양 모드 공통, raw 프레임)
+    if(!dangerOnly) Object.assign(env, detectSteps());   // 계단/턱은 '자세히'에서만(휴리스틱 부정확)
     try{
       if(mode==="coco" && cocoModel){
         dets = cocoToDets(await cocoModel.detect(video, 20));
@@ -270,11 +289,12 @@ async function loop(){
         const a = analyzeSeg(res, W, H); dets=a.dets; Object.assign(env, a.env); nav=a.nav;
       }
     }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
-    const hazards = engine.process(dets, env, W, H);
+    let hazards = engine.process(dets, env, W, H);
+    if(dangerOnly) hazards = hazards.filter(h=>L.DANGER_KINDS.has(h.kind));  // 위험요소만
     const alerts = scheduler.feed(hazards, t, moving);
     for(const al of alerts){ showCaption(al); speak(al); vibrate(al.level); }
-    // 내비게이션(방향): 위험이 없을 때만, 위험이 있으면 완전 억제(안전 우선)
-    if(navOn && nav){
+    // 내비게이션(방향)은 '자세히' + 내비 ON 일 때만 (위험 있으면 억제)
+    if(navOn && !dangerOnly && nav){
       const navAlert = navGuide.update(nav.dir, t, {moving, hazardActive: hazards.length>0});
       if(navAlert && alerts.length===0){ showCaption(navAlert); speak(navAlert); }
       $("#mode").textContent = (mode==="coco"?"빠름":"정밀") + " ▸" + nav.dir;
@@ -287,9 +307,11 @@ async function loop(){
 }
 
 // ---------------- 시작/정지/모드 ----------------
-function primeVoice(){ // iOS 음성/오디오 잠금 해제 (사용자 제스처 안 1회)
+function primeVoice(){ // iOS 오디오/음성 잠금 해제 (사용자 제스처 안 1회)
   beep(660,60,0.05);
-  if("speechSynthesis" in window){ if(!koVoice) pickVoice(); const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
+  const c = clipMap["걸음지기 시작"];
+  if(c){ try{ c.currentTime=0; const p=c.play(); if(p&&p.catch)p.catch(()=>{}); }catch(e){} }
+  else if("speechSynthesis" in window){ if(!koVoice) pickVoice(); const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
 }
 async function ensureModel(){
   statusEl.textContent="모델 로딩…";
@@ -332,6 +354,12 @@ $("#navBtn").onclick=()=>{
   navOn=!navOn; $("#navBtn").textContent="내비 "+(navOn?"ON":"OFF");
   $("#navBtn").style.background=navOn?"#1e7a3a":"#1c2a55";
   if(navOn && mode!=="seg") statusEl.textContent="내비게이션은 '정밀 보행로' 모드에서 동작합니다.";
+};
+$("#dangerBtn").onclick=()=>{
+  dangerOnly=!dangerOnly;
+  $("#dangerBtn").textContent = dangerOnly?"위험만":"자세히";
+  $("#dangerBtn").style.background = dangerOnly?"#7a2030":"#1c2a55";
+  statusEl.textContent = dangerOnly?"위험요소만 안내합니다":"자세히 — 길안내·계단·점자블록 포함";
 };
 $("#videoBtn").onclick=()=>$("#videoFile").click();
 $("#videoFile").onchange=e=>{ const f=e.target.files[0]; if(f) startVideo(f); };
