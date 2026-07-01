@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 yolov8n.pt
 demo_out.mp4
+mobile/_dev_cert.pem

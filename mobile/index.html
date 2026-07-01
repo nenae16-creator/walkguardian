@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
+<title>걸음지기 — 청각 보행 보조</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  :root{--bg:#0b1020;--fg:#e8ecff;--muted:#8ea0c8;--l1:#e01e1e;--l2:#e07814;--l3:#d2b400;--l4:#7a7a7a;--accent:#22c3ff}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:-apple-system,"Malgun Gothic",system-ui,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;flex-direction:column}
+  #stage{position:relative;flex:1;overflow:hidden;background:#000}
+  #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #ov{position:absolute;inset:0;width:100%;height:100%}
+  #caption{position:absolute;left:0;right:0;bottom:0;padding:18px 12px;font-size:8vw;font-weight:800;
+    text-align:center;color:#fff;background:rgba(0,0,0,.55);min-height:1.4em;letter-spacing:.02em;
+    text-shadow:0 2px 6px #000;transition:background .15s}
+  #hud{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;
+    padding:10px 12px;font-size:13px;color:var(--muted);background:linear-gradient(#000a,transparent)}
+  #bar{display:flex;gap:8px;padding:10px;background:#0e1530;align-items:center;flex-wrap:wrap}
+  button{font-size:16px;font-weight:700;padding:12px 16px;border-radius:12px;border:0;color:#fff;background:#1c2a55}
+  button.go{background:var(--accent);color:#001526;flex:1}
+  button.stop{background:#3a1030}
+  .seg{display:flex;background:#0a1230;border-radius:12px;overflow:hidden}
+  .seg button{background:transparent;border-radius:0;padding:12px 14px}
+  .seg button.on{background:#24407a}
+  #status{font-size:12px;color:var(--muted);padding:0 12px 10px}
+  .chip{padding:3px 8px;border-radius:8px;background:#132043;color:var(--accent);font-weight:700}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <video id="cam" playsinline muted></video>
+    <canvas id="ov"></canvas>
+    <div id="hud"><span id="fps">–</span><span id="mode">빠름</span><span id="mv">–</span></div>
+    <div id="caption">시작을 누르세요</div>
+  </div>
+  <div id="bar">
+    <button id="start" class="go">▶ 시작</button>
+    <button id="stopb" class="stop" style="display:none">■ 정지</button>
+    <div class="seg" id="modeSeg">
+      <button data-mode="coco" class="on">빠름</button>
+      <button data-mode="seg">정밀 보행로</button>
+    </div>
+    <button id="test">자가검사</button>
+  </div>
+  <div id="status">모델 로딩 대기…</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/deeplab@0.2.1/dist/deeplab.min.js"></script>
+<script src="walk_logic.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const video = $("#cam"), ov = $("#ov"), octx = ov.getContext("2d");
+const captionEl = $("#caption"), statusEl = $("#status");
+const L = window.WalkLogic;
+const engine = new L.WalkingRiskEngine();
+const scheduler = new L.AlertScheduler();
+const tracker = new L.Tracker();
+
+let mode = "coco";            // coco | seg
+let cocoModel = null, segModel = null;
+let running = false, lastT = 0, frames = 0, fpsT = 0;
+let stream = null;
+
+// ---- 보행 코리도(전방 발밑 경로): 화면 하단-중앙 사다리꼴 ----
+function corridor(W, H){ return { x1:0.30*W, x2:0.70*W, y1:0.45*H, y2:H }; }
+
+// ---- 프레임차 기반 '보행 중' 추정(권한 불필요) ----
+const prevSmall = document.createElement("canvas"); prevSmall.width=32; prevSmall.height=24;
+const pctx = prevSmall.getContext("2d",{willReadFrequently:true});
+let prevPix = null;
+function estimateMoving(){
+  pctx.drawImage(video,0,0,32,24);
+  const cur = pctx.getImageData(0,0,32,24).data;
+  if(!prevPix){ prevPix = cur.slice(0); return true; }
+  let diff=0; for(let i=0;i<cur.length;i+=4){ diff += Math.abs(cur[i]-prevPix[i]); }
+  prevPix = cur.slice(0);
+  return (diff/(32*24)) > 6;      // 경험적 임계값
+}
+
+// ---------------- 음성 (Web Speech, 한국어, 오프라인) ----------------
+let koVoice = null;
+function pickVoice(){
+  const vs = speechSynthesis.getVoices();
+  koVoice = vs.find(v=>/ko(-|_)?KR/i.test(v.lang)) || vs.find(v=>/korean|한국/i.test(v.name)) || null;
+}
+if("speechSynthesis" in window){ speechSynthesis.onvoiceschanged = pickVoice; pickVoice(); }
+let speaking = false;
+function speak(alert){
+  const t = alert.text;
+  if(!("speechSynthesis" in window)) return;
+  if(alert.level===1) speechSynthesis.cancel();       // 즉시위험은 현재 발화 끊고 우선
+  else if(speaking || speechSynthesis.speaking) return; // 채널 하나: 말하는 중이면 하위는 skip
+  const u = new SpeechSynthesisUtterance(t);
+  u.lang="ko-KR"; if(koVoice) u.voice=koVoice; u.rate=1.15; u.pitch=1;
+  u.onstart=()=>speaking=true; u.onend=()=>speaking=false; u.onerror=()=>speaking=false;
+  speechSynthesis.speak(u);
+}
+function vibrate(level){ if(navigator.vibrate){ navigator.vibrate(level===1?[120,60,120]:[80]); } }
+
+function showCaption(alert){
+  const col={1:"#e01e1e",2:"#e07814",3:"#d2b400",4:"#555"}[alert.level]||"#333";
+  captionEl.textContent = alert.text;
+  captionEl.style.background = col+"e6";
+}
+
+// ---------------- 탐지 → 스키마 변환 ----------------
+function cocoToDets(preds){
+  const out=[];
+  for(const p of preds){
+    const [x,y,w,h]=p.bbox;
+    out.push({cls:p.class, conf:p.score, xyxy:[x,y,x+w,y+h]});
+  }
+  return tracker.update(out);
+}
+
+// ---------------- DeepLab(Cityscapes) 분석: 보행로 + 전봇대/차/사람 + 침범물 ----------------
+const WALKABLE = new Set(["road","sidewalk","terrain"]);
+const SEG_OBST = {pole:"pole", person:"person", car:"car", truck:"truck",
+  bus:"bus", motorcycle:"motorcycle", bicycle:"bicycle", rider:"person"};
+let colorToClass = null;
+function buildColorMap(legend){
+  colorToClass={};
+  try{ // 전체 Cityscapes 컬러맵(안정) — 프레임별 legend 는 present 클래스만 담아 누락 위험
+    const cm=deeplab.getColormap("cityscapes"), lb=deeplab.getLabels("cityscapes");
+    if(cm&&lb) for(let i=0;i<lb.length;i++){ const c=cm[i]; colorToClass[c[0]+","+c[1]+","+c[2]]=lb[i]; }
+  }catch(e){}
+  if(legend) for(const k in legend){ const c=legend[k]; colorToClass[c[0]+","+c[1]+","+c[2]]=k; }
+}
+function analyzeSeg(res, W, H){
+  if(!colorToClass) buildColorMap(res.legend);
+  const {width:sw, height:sh, segmentationMap:map}=res; // map: Uint8, 채널수 실측
+  const ch=Math.max(3, Math.round(map.length/(sw*sh))); // RGB(3) 또는 RGBA(4) 대응
+  const cor=corridor(1,1); // 정규화 코리도
+  let corTot=0, corWalk=0;
+  const boxes={}; // class -> [minx,miny,maxx,maxy] (정규화)
+  const step=2;
+  for(let yy=0; yy<sh; yy+=step){
+    const ny=yy/sh;
+    for(let xx=0; xx<sw; xx+=step){
+      const i=(yy*sw+xx)*ch;
+      const cls=colorToClass[map[i]+","+map[i+1]+","+map[i+2]];
+      if(!cls) continue;
+      const nx=xx/sw;
+      // 코리도(전방 경로) 내부인가
+      if(nx>=cor.x1 && nx<=cor.x2 && ny>=cor.y1){
+        corTot++; if(WALKABLE.has(cls)) corWalk++;
+      }
+      // 장애물 클래스 bbox 누적(전체 프레임)
+      const oc=SEG_OBST[cls];
+      if(oc){ const b=boxes[oc]||(boxes[oc]=[1,1,0,0]);
+        if(nx<b[0])b[0]=nx; if(ny<b[1])b[1]=ny; if(nx>b[2])b[2]=nx; if(ny>b[3])b[3]=ny; }
+    }
+  }
+  const dets=[];
+  for(const oc in boxes){ const b=boxes[oc];
+    dets.push({cls:oc, conf:0.7, xyxy:[b[0]*W,b[1]*H,b[2]*W,b[3]*H]}); }
+  tracker.update(dets);
+  const env={};
+  const walkFrac = corTot? corWalk/corTot : 0;
+  if(corTot>20 && walkFrac<0.35) env.obstacle="front";  // 전방 경로가 대부분 보행불가 → 장애물/차단
+  else if(corTot>20 && walkFrac<0.6) env.boundary=true;  // 경로 절반 이하 보행가능 → 보도 끝/벗어남
+  return {dets, env};
+}
+
+// ---------------- 오버레이 ----------------
+function drawOverlay(dets, W, H){
+  ov.width=W; ov.height=H; octx.clearRect(0,0,W,H);
+  const cor=corridor(W,H);
+  octx.strokeStyle="rgba(34,195,255,.6)"; octx.lineWidth=3;
+  octx.beginPath(); octx.moveTo(cor.x1,cor.y1); octx.lineTo(cor.x2,cor.y1);
+  octx.lineTo(cor.x2,cor.y2); octx.lineTo(cor.x1,cor.y2); octx.closePath(); octx.stroke();
+  for(const d of dets){
+    const [x1,y1,x2,y2]=d.xyxy;
+    const band=L.geometry.proximityBand(d.xyxy,W,H);
+    octx.strokeStyle = band===L.geometry.NEAR?"#e01e1e":band===L.geometry.MID?"#e07814":"#22c37a";
+    octx.lineWidth=3; octx.strokeRect(x1,y1,x2-x1,y2-y1);
+    octx.fillStyle=octx.strokeStyle; octx.font="16px sans-serif";
+    octx.fillText(d.cls,x1+2,Math.max(14,y1-4));
+  }
+}
+
+// ---------------- 메인 루프 ----------------
+async function loop(){
+  if(!running) return;
+  const W=video.videoWidth, H=video.videoHeight;
+  if(W&&H){
+    const t=performance.now()/1000;
+    const moving=estimateMoving();
+    let dets=[], env=null;
+    try{
+      if(mode==="coco" && cocoModel){
+        dets = cocoToDets(await cocoModel.detect(video, 20));
+      } else if(mode==="seg" && segModel){
+        const res = await segModel.segment(video);
+        const a = analyzeSeg(res, W, H); dets=a.dets; env=a.env;
+      }
+    }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
+    const hazards = engine.process(dets, env, W, H);
+    for(const al of scheduler.feed(hazards, t, moving)){
+      showCaption(al); speak(al); vibrate(al.level);
+    }
+    drawOverlay(dets, W, H);
+    $("#mv").textContent = moving?"보행중":"정지";
+    frames++; if(t-fpsT>=1){ $("#fps").textContent=frames+" fps"; frames=0; fpsT=t; }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------------- 시작/정지/모드 ----------------
+async function start(){
+  try{
+    statusEl.textContent="카메라 여는 중…";
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280}},audio:false});
+    video.srcObject=stream; await video.play();
+  }catch(e){ statusEl.textContent="카메라 실패: "+e.message+" (HTTPS 필요)"; return; }
+  // iOS 음성 잠금 해제 (사용자 제스처 안에서 1회 발화)
+  if("speechSynthesis" in window){ const u=new SpeechSynthesisUtterance("걸음지기 시작"); u.lang="ko-KR"; if(koVoice)u.voice=koVoice; speechSynthesis.speak(u); }
+  statusEl.textContent="모델 로딩…";
+  if(mode==="coco" && !cocoModel) cocoModel = await cocoSsd.load({base:"lite_mobilenet_v2"});
+  if(mode==="seg" && !segModel) segModel = await deeplab.load({base:"cityscapes",quantizationBytes:2});
+  statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름(객체)":"정밀 보행로(전봇대·보도)");
+  running=true; $("#start").style.display="none"; $("#stopb").style.display="";
+  fpsT=performance.now()/1000; loop();
+}
+function stop(){ running=false; if(stream){stream.getTracks().forEach(t=>t.stop());} $("#start").style.display=""; $("#stopb").style.display="none"; captionEl.textContent="정지됨"; captionEl.style.background="rgba(0,0,0,.55)"; if("speechSynthesis"in window)speechSynthesis.cancel(); }
+
+$("#start").onclick=start; $("#stopb").onclick=stop;
+$("#modeSeg").onclick=async e=>{
+  const b=e.target.closest("button[data-mode]"); if(!b) return;
+  [...$("#modeSeg").children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
+  mode=b.dataset.mode; $("#mode").textContent = mode==="coco"?"빠름":"정밀";
+  colorToClass=null;
+  if(running){ statusEl.textContent="모델 전환 중…";
+    if(mode==="coco" && !cocoModel) cocoModel=await cocoSsd.load({base:"lite_mobilenet_v2"});
+    if(mode==="seg" && !segModel) segModel=await deeplab.load({base:"cityscapes",quantizationBytes:2});
+    statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름":"정밀 보행로");
+  }
+};
+$("#test").onclick=()=>{
+  const r=L.selfTest();
+  const ok=r.every(x=>x[1]);
+  statusEl.textContent="자가검사: "+r.map(x=>x[0]+(x[1]?"✓":"✗")).join(" · ")+(ok?"  → 전부 통과":"  → 실패");
+  console.log("selfTest", r);
+};
+window.__selfTest = L.selfTest;   // 자동 검증용
+</script>
+</body>
+</html>

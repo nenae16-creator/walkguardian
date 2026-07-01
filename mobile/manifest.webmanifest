@@ -1,0 +1,13 @@
+{
+  "name": "걸음지기 — 청각 보행 보조",
+  "short_name": "걸음지기",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1020",
+  "theme_color": "#0b1020",
+  "description": "시각장애인 AI 청각 보행 보조 (보조 정보 제공용, 흰지팡이·안내견 대체 아님)",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
