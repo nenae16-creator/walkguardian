@@ -1,0 +1,12 @@
+# 코어 로직(순수 파이썬) — 이미 대부분 설치되어 있음
+numpy
+scipy
+
+# 라이브 데모용 (영상/카메라 추론 + 음성)
+opencv-python
+pillow
+ultralytics        # YOLOv8 (torch 필요, 이미 설치됨)
+pyttsx3            # 오프라인 TTS (Windows SAPI) — 인터넷 불필요
+
+# 선택: 온라인 TTS 폴백
+# gtts
