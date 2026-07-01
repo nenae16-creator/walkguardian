@@ -59,6 +59,7 @@
 
 <!-- WebXR 깊이 세션용 화면 오버레이(자막) -->
 <div id="xrOverlay" style="display:none;position:fixed;inset:0;pointer-events:none;z-index:50">
+  <div id="xrDiag" style="position:absolute;top:14px;left:14px;font-size:13px;color:#bcd;background:#0009;padding:6px 10px;border-radius:8px"></div>
   <div id="xrCap" style="position:absolute;left:0;right:0;bottom:12%;text-align:center;font-size:9vw;font-weight:800;color:#fff;padding:16px;text-shadow:0 2px 8px #000"></div>
   <button id="xrEnd" style="position:absolute;top:14px;right:14px;pointer-events:auto;font-size:16px;font-weight:700;padding:10px 16px;border-radius:10px;border:0;background:#3a1030;color:#fff">종료</button>
 </div>
@@ -357,15 +358,64 @@ function stop(){
 }
 
 // ---------------- 깊이(WebXR/ARCore, 안드로이드 Chrome) ----------------
-let xrSession=null, xrRef=null;
+// CPU/GPU 두 방식 자동 대응. GPU(gpu-optimized)면 LUMINANCE_ALPHA 텍스처를 RGBA8로
+// passthrough 렌더 후 readPixels → raw16=R+A*256 → meters=raw16*rawValueToMeters.
+let xrSession=null, xrRef=null, xrGL=null, depthGL=null, depthUsage=null;
 function xrCap(text,bg){ const e=$("#xrCap"); if(e){ e.textContent=text; e.style.background=(bg||"#e07814")+"e6"; } }
-function sampleDepthGrid(dep){
+function xrDiag(t){ const e=$("#xrDiag"); if(e) e.textContent=t; }
+const clamp01=v=>v<0?0:v>1?1:v;
+function linkProg(gl,vsSrc,fsSrc){
+  const c=(t,s)=>{ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh); return sh; };
+  const p=gl.createProgram(); gl.attachShader(p,c(gl.VERTEX_SHADER,vsSrc)); gl.attachShader(p,c(gl.FRAGMENT_SHADER,fsSrc)); gl.linkProgram(p); return p;
+}
+function setupDepthGL(gl, session, usage){
+  const R={gl, binding: usage==="gpu-optimized"?new XRWebGLBinding(session,gl):null, tw:0, th:0};
+  const vs="attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv; void main(){ vUv=aUv; gl_Position=vec4(aPos,0.0,1.0); }";
+  const fs="precision highp float; uniform sampler2D uDepthTex; varying vec2 vUv; void main(){ vec4 s=texture2D(uDepthTex,vUv); gl_FragColor=vec4(s.r,0.0,0.0,s.a); }";
+  R.prog=linkProg(gl,vs,fs); R.uLoc=gl.getUniformLocation(R.prog,"uDepthTex");
+  R.aPos=gl.getAttribLocation(R.prog,"aPos"); R.aUv=gl.getAttribLocation(R.prog,"aUv");
+  R.vbo=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,R.vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,0,0, 3,-1,2,0, -1,3,0,2]), gl.STATIC_DRAW); // 풀스크린 삼각형
+  R.fbo=gl.createFramebuffer(); R.tgt=gl.createTexture();
+  R.ensureSize=(w,h)=>{ if(w===R.tw&&h===R.th) return; R.tw=w; R.th=h;
+    gl.bindTexture(gl.TEXTURE_2D,R.tgt);
+    gl.texImage2D(gl.TEXTURE_2D,0,(gl.RGBA8||gl.RGBA),w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,R.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,R.tgt,0);
+  };
+  return R;
+}
+// depthInfo → (nx,ny∈[0,1] 좌상단원점)→meters|null 리더 (CPU/GPU 자동 판별)
+function buildDepthReader(depthInfo){
+  if(typeof depthInfo.getDepthInMeters==="function"){   // CPU 경로
+    return (nx,ny)=>{ try{ const m=depthInfo.getDepthInMeters(clamp01(nx),clamp01(ny)); return (m>0&&isFinite(m))?m:null; }catch(e){ return null; } };
+  }
+  const d=depthInfo, gl=depthGL.gl, W=d.width, H=d.height;   // GPU 경로
+  if(d.textureType==="texture-array") return ()=>null;       // 멀티뷰 미지원
+  depthGL.ensureSize(W,H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, depthGL.fbo); gl.viewport(0,0,W,H);
+  gl.useProgram(depthGL.prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, d.texture); gl.uniform1i(depthGL.uLoc,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, depthGL.vbo);
+  gl.enableVertexAttribArray(depthGL.aPos); gl.vertexAttribPointer(depthGL.aPos,2,gl.FLOAT,false,16,0);
+  gl.enableVertexAttribArray(depthGL.aUv);  gl.vertexAttribPointer(depthGL.aUv,2,gl.FLOAT,false,16,8);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  const px=new Uint8Array(W*H*4);
+  gl.readPixels(0,0,W,H,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  const t=d.normDepthBufferFromNormView.matrix, r2m=d.rawValueToMeters;
+  return (nx,ny)=>{ nx=clamp01(nx); ny=clamp01(ny);
+    const bx=t[0]*nx+t[4]*ny+t[12], by=t[1]*nx+t[5]*ny+t[13];
+    const col=Math.min(Math.max(Math.floor(bx*W),0),W-1), row=Math.min(Math.max(Math.floor(by*H),0),H-1);
+    const i=(col+row*W)*4, raw=px[i]+px[i+3]*256;
+    if(raw===0) return null; const m=raw*r2m; return isFinite(m)?m:null;
+  };
+}
+function sampleDepthGrid(reader){
   const rows=5, cols=5, grid=[];
   for(let r=0;r<rows;r++){ const row=[]; const ny=0.45+0.50*(r/(rows-1));
-    for(let c=0;c<cols;c++){ const nx=0.30+0.40*(c/(cols-1));
-      let d=null; try{ d=dep.getDepthInMeters(nx,ny); }catch(e){}
-      row.push((d&&isFinite(d))?d:null);
-    } grid.push(row);
+    for(let c=0;c<cols;c++){ row.push(reader(0.30+0.40*(c/(cols-1)), ny)); }
+    grid.push(row);
   }
   return grid;
 }
@@ -380,32 +430,40 @@ async function startDepth(){
     sess=await navigator.xr.requestSession("immersive-ar",{
       requiredFeatures:["depth-sensing"],
       optionalFeatures:["dom-overlay"],
-      depthSensing:{usagePreference:["cpu-optimized"],dataFormatPreference:["luminance-alpha","float32"]},
+      depthSensing:{usagePreference:["cpu-optimized","gpu-optimized"],dataFormatPreference:["luminance-alpha","float32"]},
       domOverlay:{root:$("#xrOverlay")}
     });
   }catch(e){ statusEl.textContent="깊이 세션 실패: "+e.message+" — 기기가 ARCore 깊이 미지원일 수 있음"; return; }
   xrSession=sess;
-  const gl=document.createElement("canvas").getContext("webgl",{xrCompatible:true});
-  try{ await gl.makeXRCompatible(); }catch(e){}
-  sess.updateRenderState({baseLayer:new XRWebGLLayer(sess,gl)});
+  const cv=document.createElement("canvas");
+  xrGL = cv.getContext("webgl2",{xrCompatible:true}) || cv.getContext("webgl",{xrCompatible:true});
+  try{ await xrGL.makeXRCompatible(); }catch(e){}
+  sess.updateRenderState({baseLayer:new XRWebGLLayer(sess,xrGL)});
+  depthUsage = sess.depthUsage;
+  const fmt = sess.depthDataFormat || sess.depthFormat;
+  depthGL = setupDepthGL(xrGL, sess, depthUsage);
   xrRef=await sess.requestReferenceSpace("viewer");
   $("#xrOverlay").style.display=""; navGuide.stable=null;
+  xrDiag("깊이 "+depthUsage+" / "+fmt);
   let noDepth=0;
   sess.addEventListener("end", ()=>{ xrSession=null; $("#xrOverlay").style.display="none"; statusEl.textContent="깊이 종료 · "+ttsStatus(); });
   const onFrame=(tms, frame)=>{
     if(!xrSession) return;
     xrSession.requestAnimationFrame(onFrame);
     const layer=sess.renderState.baseLayer;
-    if(layer){ gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); }
+    if(layer){ xrGL.bindFramebuffer(xrGL.FRAMEBUFFER, layer.framebuffer); xrGL.clearColor(0,0,0,0); xrGL.clear(xrGL.COLOR_BUFFER_BIT|xrGL.DEPTH_BUFFER_BIT); }
     const pose=frame.getViewerPose(xrRef); if(!pose) return;
-    for(const view of pose.views){
-      let dep=null; try{ dep=frame.getDepthInformation(view); }catch(e){}
-      if(!dep){ if(++noDepth===45){ xrCap("깊이 데이터 없음(기기 미지원)","#3a1030"); } continue; }
-      noDepth=0;
-      const hz=L.analyzeDepth(sampleDepthGrid(dep));   // 실측 위험만
-      for(const al of scheduler.feed(hz, tms/1000, true)){ xrCap(al.text, al.level===1?"#e01e1e":"#e07814"); speak(al); vibrate(al.level); }
-      break;
-    }
+    const view=pose.views[0]; if(!view) return;
+    let dep=null;
+    try{ dep = (depthUsage==="cpu-optimized") ? frame.getDepthInformation(view) : depthGL.binding.getDepthInformation(view); }catch(e){}
+    if(!dep){ if(++noDepth===45){ xrCap("깊이 데이터 없음","#3a1030"); } return; }
+    noDepth=0;
+    const reader=buildDepthReader(dep);
+    const grid=sampleDepthGrid(reader);
+    const center=grid[1][2];
+    xrDiag("깊이 "+depthUsage+" · 전방 "+(center!=null?center.toFixed(2)+"m":"—"));
+    const hz=L.analyzeDepth(grid);
+    for(const al of scheduler.feed(hz, tms/1000, true)){ xrCap(al.text, al.level===1?"#e01e1e":"#e07814"); speak(al); vibrate(al.level); }
   };
   sess.requestAnimationFrame(onFrame);
   statusEl.textContent="깊이(실험) 동작 중 — 전방 물체/턱을 실측 감지";
