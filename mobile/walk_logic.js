@@ -33,29 +33,40 @@
   }
   function sideWord(zone) { return zone === LEFT ? "왼쪽" : zone === RIGHT ? "오른쪽" : "앞"; }
 
-  // 정차 vs 이동 판별기: 박스 면적 증가율(접근)과 중심 이동(횡단)을 함께 추적.
-  // ※ 카메라가 걷는 사람 몸에 있어 모든 것이 겉보기로 움직이므로, '빠른 증가'만
-  //   실제 이동 차량으로 간주(천천히 커지면 우리가 정차물에 다가가는 것으로 해석).
-  const GROW_FAST = 1.6, GROW_SLOW = 1.15, SHRINK = 0.9, LAT_MOVE = 0.10;
+  // 정차 vs 이동 판별기 (에고 움직임 보정).
+  // 손에 든 폰이라 정차 차도 걸어가면 커짐 → 여러 물체의 '공통 증가율(median)'을
+  // 카메라(에고) 움직임으로 보고, 그보다 더 빨리 커지는 것만 '진짜 접근'으로 판정.
+  const GROW_FAST = 1.6, SHRINK = 0.9, LAT_MOVE = 0.10;
+  const RESID_APPROACH = 1.35, RESID_RECEDE = 0.7;
+  function median(a) { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; }
   class MotionTracker {
     constructor(history = 6) { this.h = history; this.buf = new Map(); }
     _key(det, zone) { return det.id != null ? "id:" + det.id : det.cls + ":" + zone; }
-    update(det, area, cx, zone) {
+    update(det, area, cx, zone) {   // 원시 관측만 반환(분류는 에고 보정 후 별도)
       const k = this._key(det, zone);
       let b = this.buf.get(k); if (!b) { b = []; this.buf.set(k, b); }
       b.push({ a: area, cx }); if (b.length > this.h) b.shift();
-      if (b.length < 3) return { state: "UNKNOWN", growth: 1, lateral: 0 };
+      if (b.length < 3) return { valid: false, growth: 1, dx: 0 };
       const first = b[0], last = b[b.length - 1];
-      const growth = last.a / (first.a > 0 ? first.a : 1e-9);
-      const lateral = Math.abs(last.cx - first.cx);
-      let state;
-      if (growth >= GROW_FAST) state = "APPROACH_FAST";
-      else if (lateral >= LAT_MOVE) state = "CROSSING";
-      else if (growth >= GROW_SLOW) state = "APPROACH_SLOW";
-      else if (growth <= SHRINK) state = "RECEDING";
-      else state = "STATIONARY";
-      return { state, growth, lateral };
+      return { valid: true, growth: last.a / (first.a > 0 ? first.a : 1e-9), dx: last.cx - first.cx };
     }
+  }
+  // 에고 보정 분류: ego={growth,dx,n}(주변 물체 median). moving=사용자 보행 여부.
+  function classifyMotion(m, moving, ego) {
+    if (!m.valid) return "UNKNOWN";
+    if (moving && ego.n >= 2) {                         // 걷는 중 + 기준물 충분 → 잔여(residual)로 판정
+      const rg = m.growth / (ego.growth > 0.3 ? ego.growth : 1);   // 에고 대비 얼마나 더 커지나
+      const rdx = m.dx - ego.dx;                        // 에고(팬) 보정한 좌우 이동
+      if (rg >= RESID_APPROACH) return "APPROACH_FAST"; // 배경보다 빨리 커짐 = 나에게 접근
+      if (Math.abs(rdx) >= LAT_MOVE) return "CROSSING";
+      if (rg <= RESID_RECEDE) return "RECEDING";
+      return "STATIONARY";                              // 배경과 같은 비율 = 정차/주차
+    }
+    // 폴백(정지 중 또는 기준물 부족): 절대 증가율 — 안전 우선(빠르면 접근 경고)
+    if (m.growth >= GROW_FAST) return "APPROACH_FAST";
+    if (Math.abs(m.dx) >= LAT_MOVE) return "CROSSING";
+    if (m.growth <= SHRINK) return "RECEDING";
+    return "STATIONARY";
   }
 
   function iou(a, b) {
@@ -135,35 +146,42 @@
 
   class WalkingRiskEngine {
     constructor(confGate = 0.35) { this.confGate = confGate; this.motion = new MotionTracker(); }
-    process(dets, env, W, H) {
+    process(dets, env, W, H, moving) {
+      moving = moving !== false;
       const hz = [];
+      // pass 1: 원시 관측 수집
+      const obs = [];
       for (const d of dets) {
         if ((d.conf == null ? 1 : d.conf) < this.confGate) continue;
-        const cls = d.cls, xyxy = d.xyxy;
-        const zone = horizontalZone(xyxy, W);
-        const band = proximityBand(xyxy, W, H);
-        const prox = areaRatio(xyxy, W, H);
-        const cx = (xyxy[0] + xyxy[2]) / 2 / W;
+        const xyxy = d.xyxy;
+        const zone = horizontalZone(xyxy, W), band = proximityBand(xyxy, W, H);
+        const prox = areaRatio(xyxy, W, H), cx = (xyxy[0] + xyxy[2]) / 2 / W;
         const m = this.motion.update(d, prox, cx, zone);
-        const conf = d.conf == null ? 1 : d.conf;
+        obs.push({ cls: d.cls, zone, band, prox, conf: d.conf == null ? 1 : d.conf, m });
+      }
+      // 에고(카메라) 움직임 = 유효 관측들의 median 증가율/좌우이동
+      const gs = obs.filter(o => o.m.valid).map(o => o.m.growth);
+      const ds = obs.filter(o => o.m.valid).map(o => o.m.dx);
+      const ego = { growth: median(gs) == null ? 1 : median(gs), dx: median(ds) == null ? 0 : median(ds), n: gs.length };
 
+      // pass 2: 에고 보정 분류 + 위험 생성
+      for (const o of obs) {
+        const { cls, zone, band, prox, conf, m } = o;
         if (VEHICLE.has(cls) || MOTO.has(cls)) {
           const isMoto = MOTO.has(cls);
-          if (m.state === "APPROACH_FAST" && (band === NEAR || band === MID)) {
-            // 빠르게 다가오는(=움직이는) 차량 → 즉시 위험
+          const st = classifyMotion(m, moving, ego);
+          if (st === "APPROACH_FAST" && (band === NEAR || band === MID)) {
             hz.push(Hazard(L1, isMoto ? "moto_imminent" : "vehicle_imminent", zone, conf, prox));
-          } else if (m.state === "CROSSING" && (band === NEAR || band === MID)) {
+          } else if (st === "CROSSING" && (band === NEAR || band === MID)) {
             hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_moving", zone, conf, prox));
-          } else if ((m.state === "APPROACH_SLOW" || m.state === "STATIONARY") && band === NEAR) {
-            // 안 움직이는 차 = 정차/주차 → 정면 근접 시 장애물성 안내
+          } else if (st === "STATIONARY" && band === NEAR) {
             if (zone === CENTER) hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_parked", zone, conf, prox));
-          } else if (m.state === "UNKNOWN" && band === NEAR && zone === CENTER) {
+          } else if (st === "UNKNOWN" && band === NEAR && zone === CENTER) {
             hz.push(Hazard(L2, "vehicle_caution", zone, conf, prox));
           }
         } else if (PERSON.has(cls)) {
           if (zone === CENTER && band === NEAR) hz.push(Hazard(L2, "person_front", zone, conf, prox));
         } else {
-          // 정적 장애물: NEAR 는 물론, 알려진 정적 클래스는 MID 에서도 잡음(전봇대·꼬깔콘 인식률↑)
           if (zone === CENTER && (band === NEAR || (band === MID && STATIC_OBST.has(cls))))
             hz.push(Hazard(L2, "obstacle_front", zone, conf, prox));
         }
@@ -294,7 +312,7 @@
     const run = (seq, movingSeq) => {
       const eng = new WalkingRiskEngine(), sch = new AlertScheduler(), out = [];
       seq.forEach(([dets, env], i) => { const t = i/10, moving = movingSeq ? movingSeq[i] : true;
-        for (const a of sch.feed(eng.process(dets, env, W, H), t, moving)) out.push([+t.toFixed(2), a.level, a.text]); });
+        for (const a of sch.feed(eng.process(dets, env, W, H, moving), t, moving)) out.push([+t.toFixed(2), a.level, a.text]); });
       return out;
     };
     const R = [];
@@ -306,6 +324,11 @@
     seq = []; for (let i = 0; i < 8; i++) seq.push([[{cls:"car",conf:.9,id:2,xyxy:box(0.5,0.5)}], null]);
     o = run(seq);
     R.push(["정차/이동 구분", o.some(r=>r[2].includes("정차")) && !o.some(r=>r[2].includes("접근")), o]);
+    // ②b 에고 보정: 걸어가며 지나치는 '주차차 여러 대'가 함께 커져도 접근 아님(정차)
+    seq = []; for (let i = 0; i < 7; i++) { const s = 0.30 + i*0.02;
+      seq.push([[{cls:"car",conf:.9,id:11,xyxy:box(0.50,s)},{cls:"car",conf:.9,id:12,xyxy:box(0.44,s)},{cls:"car",conf:.9,id:13,xyxy:box(0.56,s)}], null]); }
+    o = run(seq);
+    R.push(["에고보정 정차 구분", o.some(r=>r[2].includes("정차")) && !o.some(r=>r[2].includes("접근")), o]);
     // ① 가까운 것 먼저: 큰 의자(가까움) vs 사람 → 의자 먼저
     seq = []; for (let i = 0; i < 5; i++) seq.push([[{cls:"chair",conf:.9,id:3,xyxy:box(0.5,0.5)},{cls:"person",conf:.9,id:4,xyxy:box(0.5,0.30)}], null]);
     o = run(seq);

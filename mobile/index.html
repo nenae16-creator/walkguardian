@@ -297,7 +297,7 @@ async function loop(){
         const a = analyzeSeg(res, W, H); dets=a.dets; Object.assign(env, a.env); nav=a.nav;
       }
     }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
-    let hazards = engine.process(dets, env, W, H);
+    let hazards = engine.process(dets, env, W, H, moving);   // moving=에고 보정에 사용
     if(dangerOnly) hazards = hazards.filter(h=>L.DANGER_KINDS.has(h.kind));  // 위험요소만
     const alerts = scheduler.feed(hazards, t, moving);
     for(const al of alerts){ showCaption(al); speak(al); vibrate(al.level); }
@@ -436,13 +436,13 @@ async function startDepth(){
   }catch(e){ statusEl.textContent="깊이 세션 실패: "+e.message+" — 기기가 ARCore 깊이 미지원일 수 있음"; return; }
   xrSession=sess;
   const cv=document.createElement("canvas");
-  xrGL = cv.getContext("webgl2",{xrCompatible:true}) || cv.getContext("webgl",{xrCompatible:true});
+  xrGL = cv.getContext("webgl2",{xrCompatible:true,alpha:true}) || cv.getContext("webgl",{xrCompatible:true,alpha:true});
   try{ await xrGL.makeXRCompatible(); }catch(e){}
-  sess.updateRenderState({baseLayer:new XRWebGLLayer(sess,xrGL)});
+  sess.updateRenderState({baseLayer:new XRWebGLLayer(sess,xrGL,{alpha:true})});   // 투명 → 카메라 패스스루 보임
   depthUsage = sess.depthUsage;
   const fmt = sess.depthDataFormat || sess.depthFormat;
   depthGL = setupDepthGL(xrGL, sess, depthUsage);
-  xrRef=await sess.requestReferenceSpace("viewer");
+  xrRef = await sess.requestReferenceSpace("local").catch(()=>sess.requestReferenceSpace("viewer"));
   $("#xrOverlay").style.display=""; navGuide.stable=null;
   xrDiag("깊이 "+depthUsage+" / "+fmt);
   let noDepth=0;
@@ -456,14 +456,16 @@ async function startDepth(){
     const view=pose.views[0]; if(!view) return;
     let dep=null;
     try{ dep = (depthUsage==="cpu-optimized") ? frame.getDepthInformation(view) : depthGL.binding.getDepthInformation(view); }catch(e){}
-    if(!dep){ if(++noDepth===45){ xrCap("깊이 데이터 없음","#3a1030"); } return; }
+    if(!dep){ if(++noDepth===45){ xrDiag("깊이 데이터 없음 · "+depthUsage); } return; }
     noDepth=0;
-    const reader=buildDepthReader(dep);
-    const grid=sampleDepthGrid(reader);
-    const center=grid[1][2];
-    xrDiag("깊이 "+depthUsage+" · 전방 "+(center!=null?center.toFixed(2)+"m":"—"));
-    const hz=L.analyzeDepth(grid);
-    for(const al of scheduler.feed(hz, tms/1000, true)){ xrCap(al.text, al.level===1?"#e01e1e":"#e07814"); speak(al); vibrate(al.level); }
+    try{
+      const reader=buildDepthReader(dep);
+      const grid=sampleDepthGrid(reader);
+      const center=grid[1][2];
+      xrDiag("깊이 "+depthUsage+" · 전방 "+(center!=null?center.toFixed(2)+"m":"—"));
+      const hz=L.analyzeDepth(grid);
+      for(const al of scheduler.feed(hz, tms/1000, true)){ xrCap(al.text, al.level===1?"#e01e1e":"#e07814"); speak(al); vibrate(al.level); }
+    }catch(e){ xrDiag("깊이 처리 오류: "+e.message); }
   };
   sess.requestAnimationFrame(onFrame);
   statusEl.textContent="깊이(실험) 동작 중 — 전방 물체/턱을 실측 감지";
