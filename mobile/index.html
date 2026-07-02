@@ -67,7 +67,13 @@
         <button data-mode="coco">빠름</button>
         <button data-mode="seg">정밀 보행로</button>
         <button data-mode="wg" class="on">국내모델</button>
+        <button data-mode="ai">AI 설명</button>
       </div>
+    </div>
+    <div class="row" style="flex-direction:column;align-items:stretch">
+      <span class="chip">AI 백엔드 (선택)</span>
+      <input id="aiUrl" placeholder="AI 백엔드 주소 https://...workers.dev" style="padding:12px;border-radius:10px;border:0;background:#0a1230;color:#fff;font-size:14px">
+      <input id="aiToken" placeholder="AI 토큰(WG_TOKEN, 선택)" style="padding:12px;border-radius:10px;border:0;background:#0a1230;color:#fff;font-size:14px;margin-top:6px">
     </div>
     <div class="row">
       <button id="dangerBtn" style="background:#7a2030">위험만</button>
@@ -117,6 +123,34 @@ let dangerOnly = true;   // 기본: 위험요소만 (길안내·참고·부정�
 
 let mode = "wg";              // 기본=국내모델 (coco | seg | wg)
 let cocoModel = null, segModel = null, wgModel = null;
+// AI 설명 모드 (백엔드 경유, 키는 서버에만)
+let aiUrl = localStorage.getItem("wgAiUrl") || "", aiToken = localStorage.getItem("wgAiToken") || "";
+let lastAI = 0, aiBusy = false; const AI_INTERVAL = 2800;
+const aiCooldown = new Map();
+const aiCanvas = document.createElement("canvas"), aictx = aiCanvas.getContext("2d");
+async function handleAI(W, H){
+  const nowMs = performance.now();
+  if(aiBusy || nowMs - lastAI < AI_INTERVAL) return;
+  if(!aiUrl){ statusEl.textContent="⚙설정에 AI 백엔드 주소를 입력하세요"; return; }
+  lastAI = nowMs; aiBusy = true;
+  try{
+    const sw = 512, sh = Math.max(1, Math.round(H * 512 / W));
+    aiCanvas.width = sw; aiCanvas.height = sh; aictx.drawImage(video, 0, 0, sw, sh);
+    const dataUrl = aiCanvas.toDataURL("image/jpeg", 0.6);
+    const hdr = { "content-type": "application/json" }; if(aiToken) hdr["x-wg-token"] = aiToken;
+    const r = await fetch(aiUrl, { method:"POST", headers:hdr, body: JSON.stringify({ image: dataUrl }) });
+    const j = await r.json();
+    const haz = (j && j.hazards) || [];
+    let spoke = false;
+    for(const text of haz){
+      if(nowMs - (aiCooldown.get(text)||0) < 5000) continue;   // 같은 안내 5초 쿨다운
+      aiCooldown.set(text, nowMs);
+      const al = { level:2, text }; showCaption(al); speak(al); vibrate(2); spoke = true;
+    }
+    if(!spoke) statusEl.textContent = "AI 분석 중…"+(haz.length?"":" (위험 없음)");
+  }catch(e){ statusEl.textContent = "AI 오류: " + e.message; }
+  finally{ aiBusy = false; }
+}
 let running = false, lastT = 0, frames = 0, fpsT = 0;
 let stream = null;
 
@@ -321,6 +355,11 @@ async function loop(){
   const W=video.videoWidth, H=video.videoHeight;
   if(W&&H){
     const t=performance.now()/1000;
+    if(mode==="ai"){                       // AI 설명 모드: 3초 간격 백엔드 분석
+      handleAI(W,H); $("#mv").textContent="AI";
+      frames++; if(t-fpsT>=1){ $("#fps").textContent=frames+" fps"; frames=0; fpsT=t; }
+      requestAnimationFrame(loop); return;
+    }
     const moving=estimateMoving();
     let dets=[], env={}, nav=null;
     if(!dangerOnly) Object.assign(env, detectSteps());   // 계단/턱은 '자세히'에서만(휴리스틱 부정확)
@@ -381,7 +420,7 @@ async function start(){       // 카메라 모드
     video.srcObject=stream; video.loop=false; await video.play();
   }catch(e){ statusEl.textContent="카메라 실패: "+e.message; $("#hintMain").textContent="카메라 권한을 켜주세요"; beep(400,300); return; }
   primeVoice(); await ensureModel();
-  beginLoop(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":"국내모델");
+  beginLoop(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":mode==="wg"?"국내모델":"AI 설명");
 }
 async function startVideo(file){  // 동영상 파일 모드 (PC/폰 공통, 카메라·방화벽 불필요)
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
@@ -585,6 +624,10 @@ $("#stage").addEventListener("click", toggleRun);
 $("#stage").addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggleRun(); } });
 $("#gear").addEventListener("click", e=>{ e.stopPropagation(); $("#settings").classList.add("open"); });
 $("#settingsClose").onclick=()=>$("#settings").classList.remove("open");
+// AI 백엔드 주소/토큰 (localStorage 저장, 키 아님)
+$("#aiUrl").value=aiUrl; $("#aiToken").value=aiToken;
+$("#aiUrl").oninput=e=>{ aiUrl=e.target.value.trim(); localStorage.setItem("wgAiUrl",aiUrl); };
+$("#aiToken").oninput=e=>{ aiToken=e.target.value.trim(); localStorage.setItem("wgAiToken",aiToken); };
 
 $("#start").onclick=(e)=>{ if(e&&e.stopPropagation)e.stopPropagation(); start(); };
 $("#stopb").onclick=(e)=>{ if(e&&e.stopPropagation)e.stopPropagation(); stop(); };
@@ -616,10 +659,10 @@ $("#sound").onclick=()=>{   // 소리 테스트 + iOS 오디오 잠금 해제
 $("#modeSeg").onclick=async e=>{
   const b=e.target.closest("button[data-mode]"); if(!b) return;
   [...$("#modeSeg").children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
-  mode=b.dataset.mode; $("#mode").textContent = mode==="coco"?"빠름":mode==="seg"?"정밀":"국내";
+  mode=b.dataset.mode; $("#mode").textContent = mode==="coco"?"빠름":mode==="seg"?"정밀":mode==="wg"?"국내":"AI";
   colorToClass=null;
   if(running){ statusEl.textContent="모델 전환 중…"; await ensureModel();
-    statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":"국내모델");
+    statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":mode==="wg"?"국내모델":"AI 설명");
   }
 };
 $("#test").onclick=()=>{
