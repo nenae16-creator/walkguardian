@@ -45,6 +45,7 @@
     <div class="seg" id="modeSeg">
       <button data-mode="coco" class="on">빠름</button>
       <button data-mode="seg">정밀 보행로</button>
+      <button data-mode="wg">국내모델</button>
     </div>
     <button id="dangerBtn" style="background:#7a2030">위험만</button>
     <button id="navBtn">내비 OFF</button>
@@ -71,6 +72,8 @@
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/deeplab@0.2.1/dist/deeplab.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
+<script src="wg_onnx.js"></script>
 <script src="walk_logic.js"></script>
 <script>
 const $ = s => document.querySelector(s);
@@ -85,7 +88,7 @@ let navOn = false;
 let dangerOnly = true;   // 기본: 위험요소만 (길안내·참고·부정확한 계단 등 억제)
 
 let mode = "coco";            // coco | seg
-let cocoModel = null, segModel = null;
+let cocoModel = null, segModel = null, wgModel = null;
 let running = false, lastT = 0, frames = 0, fpsT = 0;
 let stream = null;
 
@@ -299,6 +302,8 @@ async function loop(){
       } else if(mode==="seg" && segModel){
         const res = await segModel.segment(video);
         const a = analyzeSeg(res, W, H); dets=a.dets; Object.assign(env, a.env); nav=a.nav;
+      } else if(mode==="wg" && wgModel){
+        dets = tracker.update(await wgModel.detect(video, W, H));   // 국내 학습 YOLOv8(onnx)
       }
     }catch(e){ statusEl.textContent="추론 오류: "+e.message; }
     let hazards = engine.process(dets, env, W, H, moving);   // moving=에고 보정에 사용
@@ -329,6 +334,9 @@ async function ensureModel(){
   statusEl.textContent="모델 로딩…";
   if(mode==="coco" && !cocoModel) cocoModel = await cocoSsd.load({base:"mobilenet_v2"});
   if(mode==="seg" && !segModel) segModel = await deeplab.load({base:"cityscapes",quantizationBytes:2});
+  if(mode==="wg" && !wgModel){ statusEl.textContent="국내모델 로딩(44MB, 최초 1회)…";
+    wgModel = new WGOnnxDetector("models/walkguardian/best.onnx");
+    const prov = await wgModel.load(); statusEl.textContent="국내모델 준비("+prov+")"; }
 }
 function beginLoop(label){
   navGuide.stable=null; navGuide.cand=null;
@@ -564,12 +572,10 @@ $("#sound").onclick=()=>{   // 소리 테스트 + iOS 오디오 잠금 해제
 $("#modeSeg").onclick=async e=>{
   const b=e.target.closest("button[data-mode]"); if(!b) return;
   [...$("#modeSeg").children].forEach(x=>x.classList.remove("on")); b.classList.add("on");
-  mode=b.dataset.mode; $("#mode").textContent = mode==="coco"?"빠름":"정밀";
+  mode=b.dataset.mode; $("#mode").textContent = mode==="coco"?"빠름":mode==="seg"?"정밀":"국내";
   colorToClass=null;
-  if(running){ statusEl.textContent="모델 전환 중…";
-    if(mode==="coco" && !cocoModel) cocoModel=await cocoSsd.load({base:"mobilenet_v2"});
-    if(mode==="seg" && !segModel) segModel=await deeplab.load({base:"cityscapes",quantizationBytes:2});
-    statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름":"정밀 보행로");
+  if(running){ statusEl.textContent="모델 전환 중…"; await ensureModel();
+    statusEl.textContent="동작 중 — "+(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":"국내모델");
   }
 };
 $("#test").onclick=()=>{
