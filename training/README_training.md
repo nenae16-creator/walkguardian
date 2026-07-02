@@ -1,8 +1,18 @@
-# 걸음지기 학습 셋업 — AI Hub #189 (인도보행 영상 / SideGuide)
+# 걸음지기 학습 셋업 (Colab)
 
 로컬 GPU가 없으므로 **Google Colab(무료/Pro GPU)** 기준. 학습한 모델을 **웹앱(mobile/)** 에 그대로 꽂는 것까지가 목표.
+공통 원칙: **탐지기(눈)만 국내 보도 특화로 교체**, 위험판단·에고보정·한국어음성·스케줄러(`walk_logic.js`)는 **재사용**.
 
-> 노트북: [`sideguide_walkguardian_colab.ipynb`](sideguide_walkguardian_colab.ipynb)
+## 두 가지 경로
+| 경로 | 노트북 | 데이터 | 언제 |
+|---|---|---|---|
+| **A. 오늘 바로** (추천 시작) | [`train_now_roboflow_colab.ipynb`](train_now_roboflow_colab.ipynb) | Roboflow 공개셋(볼라드·연석·전봇대·쓰레기통 등, YOLO 즉시) | **지금** — 가입만 하면 승인 대기 없음 |
+| **B. 국내 최강** | [`sideguide_walkguardian_colab.ipynb`](sideguide_walkguardian_colab.ipynb) | AI Hub #189 인도보행(29종, ~67만장) | AI Hub **이용신청 승인 후** |
+
+→ **먼저 A로 오늘 감을 잡고**, #189 승인되면 B로 국내 정확도를 끌어올리는 순서를 권장.
+
+---
+## B. AI Hub #189 (인도보행 영상 / SideGuide)
 
 ## 목표 2가지
 | 목표 | 무엇을 학습 | 걸음지기 어디에 |
