@@ -19,7 +19,7 @@
   }
 
   class WGOnnxDetector {
-    constructor(modelUrl, conf = 0.35, iouThr = 0.45) {
+    constructor(modelUrl, conf = 0.28, iouThr = 0.45) {   // 낮은 임계값=누락↓(도메인갭 보완)
       this.url = modelUrl; this.conf = conf; this.iouThr = iouThr;
       this.session = null; this.inputName = null; this.provider = "?";
       this.cv = document.createElement("canvas"); this.cv.width = N; this.cv.height = N;

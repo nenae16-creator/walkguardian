@@ -134,6 +134,7 @@
 
   // ---------------- risk (L1~L4) ----------------
   const L1 = 1, L2 = 2, L3 = 3, L4 = 4;
+  let ROAD_IGNORE = true;   // 인도 보행 모드: 옆 차도(좌/우)의 차량은 경고 안 함. 앞(경로 위)만.
   const VEHICLE = new Set(["car", "truck", "bus", "cars", "rikshaw"]);
   const MOTO = new Set(["motorcycle", "bicycle", "bike"]);
   const PERSON = new Set(["person"]);
@@ -150,7 +151,7 @@
   }
 
   class WalkingRiskEngine {
-    constructor(confGate = 0.35) { this.confGate = confGate; this.motion = new MotionTracker(); }
+    constructor(confGate = 0.30) { this.confGate = confGate; this.motion = new MotionTracker(); }
     process(dets, env, W, H, moving) {
       moving = moving !== false;
       const hz = [];
@@ -177,7 +178,9 @@
         } else if (VEHICLE.has(cls) || MOTO.has(cls)) {
           const isMoto = MOTO.has(cls);
           const st = classifyMotion(m, moving, ego);
-          if (st === "APPROACH_FAST" && (band === NEAR || band === MID)) {
+          if (ROAD_IGNORE && zone !== CENTER) {
+            // 인도 보행 중 옆 차도의 차량 → 무시(오경보 방지)
+          } else if (st === "APPROACH_FAST" && (band === NEAR || band === MID)) {
             hz.push(Hazard(L1, isMoto ? "moto_imminent" : "vehicle_imminent", zone, conf, prox));
           } else if (st === "CROSSING" && (band === NEAR || band === MID)) {
             hz.push(Hazard(L2, isMoto ? "moto_caution" : "vehicle_moving", zone, conf, prox));
@@ -336,6 +339,10 @@
       seq.push([[{cls:"car",conf:.9,id:11,xyxy:box(0.50,s)},{cls:"car",conf:.9,id:12,xyxy:box(0.44,s)},{cls:"car",conf:.9,id:13,xyxy:box(0.56,s)}], null]); }
     o = run(seq);
     R.push(["에고보정 정차 구분", o.some(r=>r[2].includes("정차")) && !o.some(r=>r[2].includes("접근")), o]);
+    // ★인도 보행: 옆 차도(오른쪽)에서 접근하는 차 → 경고 안 함 (앞쪽만 경고)
+    seq = []; for (let i = 0; i < 8; i++) seq.push([[{cls:"car",conf:.9,id:40,xyxy:box(0.85,0.20+i*0.03)}], null]);
+    o = run(seq);
+    R.push(["옆 차도 차량 무시", !o.some(r=>r[2].includes("차량")), o]);
     // ① 가까운 것 먼저: 큰 의자(가까움) vs 사람 → 의자 먼저
     seq = []; for (let i = 0; i < 5; i++) seq.push([[{cls:"chair",conf:.9,id:3,xyxy:box(0.5,0.5)},{cls:"person",conf:.9,id:4,xyxy:box(0.5,0.30)}], null]);
     o = run(seq);
@@ -500,5 +507,6 @@
     geo: { haversine, bearing, relSide, checkPOIs, sideWord, detectPoiColumns, rowsToPOIs },
     Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth, POIAnnouncer,
     render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, selfTestCSV, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
+    setRoadIgnore: v => { ROAD_IGNORE = !!v; },
   };
 })(typeof window !== "undefined" ? window : globalThis);
