@@ -128,17 +128,21 @@
     "vehicle_imminent", "moto_imminent", "drop_imminent",
     "vehicle_caution", "vehicle_moving", "vehicle_parked", "moto_caution",
     "obstacle_front", "person_front", "construction_front", "on_road",
+    "stairs_front", "curb_front",   // 학습모델/깊이로 신뢰도 확보 → 위험만 모드에도 포함
   ]);
-  // 제외(위험만 모드): braille_*, crosswalk, signal, boundary, stairs, curb, nav_*
+  // 제외(위험만 모드): braille_*, crosswalk, signal, boundary, nav_*
 
   // ---------------- risk (L1~L4) ----------------
   const L1 = 1, L2 = 2, L3 = 3, L4 = 4;
-  const VEHICLE = new Set(["car", "truck", "bus"]);
-  const MOTO = new Set(["motorcycle", "bicycle"]);
+  const VEHICLE = new Set(["car", "truck", "bus", "cars", "rikshaw"]);
+  const MOTO = new Set(["motorcycle", "bicycle", "bike"]);
   const PERSON = new Set(["person"]);
-  // 정적 장애물(전봇대/꼬깔콘/화분 등) — 중간거리에서도 잡음(인식률↑)
+  const STAIRS = new Set(["stairs", "stair", "staircase"]);   // 학습모델 계단(mAP 0.96)
+  // 정적 장애물 — COCO + 국내 학습모델(멀티) 클래스. 중간거리에서도 잡음(인식률↑)
   const STATIC_OBST = new Set(["fire hydrant", "bench", "chair", "potted plant",
-    "parking meter", "stop sign", "suitcase", "backpack", "pole", "cone", "traffic cone"]);
+    "parking meter", "stop sign", "suitcase", "backpack", "pole", "cone", "traffic cone",
+    "garbage-bin", "signboard", "fence", "plant", "tree", "table", "cupboard",
+    "door", "window", "block", "obstacle", "dogs", "lamb"]);
 
   function Hazard(level, kind, side, conf, prox) {
     return { level, kind, side: side || CENTER, conf: conf == null ? 1 : conf,
@@ -168,7 +172,9 @@
       // pass 2: 에고 보정 분류 + 위험 생성
       for (const o of obs) {
         const { cls, zone, band, prox, conf, m } = o;
-        if (VEHICLE.has(cls) || MOTO.has(cls)) {
+        if (STAIRS.has(cls)) {
+          if (zone === CENTER && (band === NEAR || band === MID)) hz.push(Hazard(L2, "stairs_front", CENTER, conf, prox));
+        } else if (VEHICLE.has(cls) || MOTO.has(cls)) {
           const isMoto = MOTO.has(cls);
           const st = classifyMotion(m, moving, ego);
           if (st === "APPROACH_FAST" && (band === NEAR || band === MID)) {
@@ -334,6 +340,10 @@
     seq = []; for (let i = 0; i < 5; i++) seq.push([[{cls:"chair",conf:.9,id:3,xyxy:box(0.5,0.5)},{cls:"person",conf:.9,id:4,xyxy:box(0.5,0.30)}], null]);
     o = run(seq);
     R.push(["가까운 것 먼저", o.length>0 && o[0][2].includes("장애물"), o]);
+    // 학습모델 클래스: 계단→'앞 계단 주의', 전봇대→'앞 장애물'
+    seq = []; for (let i = 0; i < 6; i++) seq.push([[{cls:"stairs",conf:.9,id:20,xyxy:box(0.5,0.5)},{cls:"pole",conf:.9,id:21,xyxy:box(0.5,0.44)}], null]);
+    o = run(seq);
+    R.push(["학습모델 계단·전봇대", o.some(r=>r[2].includes("계단")) && o.some(r=>r[2].includes("장애물")), o]);
     // 쿨다운 1회
     seq = []; for (let i = 0; i < 20; i++) seq.push([[{cls:"chair",conf:.9,id:5,xyxy:box(0.5,0.5)}], null]);
     o = run(seq);
