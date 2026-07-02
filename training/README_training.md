@@ -7,7 +7,8 @@
 | 경로 | 노트북 | 데이터 | 언제 |
 |---|---|---|---|
 | **A. 오늘 바로** (추천 시작) | [`train_now_roboflow_colab.ipynb`](train_now_roboflow_colab.ipynb) | Roboflow 공개셋(볼라드·연석·전봇대·쓰레기통 등, YOLO 즉시) | **지금** — 가입만 하면 승인 대기 없음 |
-| **B. 국내 최강** | [`sideguide_walkguardian_colab.ipynb`](sideguide_walkguardian_colab.ipynb) | AI Hub #189 인도보행(29종, ~67만장) | AI Hub **이용신청 승인 후** |
+| **B. 여러 개 합치기** | [`train_multi_roboflow_colab.ipynb`](train_multi_roboflow_colab.ipynb) | Roboflow 여러 데이터셋 통합(Deneme+Fyp 등, 클래스명 자동 병합) | 더 큰 학습 |
+| **C. 국내 최강** | [`sideguide_walkguardian_colab.ipynb`](sideguide_walkguardian_colab.ipynb) | AI Hub #189 인도보행(29종, ~67만장) | AI Hub **이용신청 승인 후** |
 
 → **먼저 A로 오늘 감을 잡고**, #189 승인되면 B로 국내 정확도를 끌어올리는 순서를 권장.
 
