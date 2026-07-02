@@ -19,18 +19,18 @@ print("GPU:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.
 !pip -q install ultralytics roboflow
 from ultralytics import YOLO""")
 
-md("""## [2] 데이터셋 받기 (Roboflow, 무료)
-1. https://universe.roboflow.com 접속 → 검색창에 **`sidewalk obstacle`** 또는 **`bollard curb`** 검색
-   - 추천: 클래스에 Bollard/Curb/Light-pole/Garbage-bin/Crosswalk 가 있는 것 (예: "sidewalk obstacle avoidance" 계열)
-2. 데이터셋 페이지 → **Download Dataset → Format: YOLOv8 → "show download code"**
-3. 뜨는 3~4줄 스니펫을 아래 셀에 **그대로 붙여넣기** (무료 가입하면 `api_key` 자동 포함)
-4. 여러 데이터셋을 합치고 싶으면 이 셀을 복제해 여러 개 받은 뒤 data.yaml 을 합쳐도 됩니다.""")
+md("""## [2] 데이터셋 받기 (Roboflow, 무료) — API 키만 넣으면 됨
+아래 셀은 **Maastricht 'Sidewalk obstacle detection'** (CC BY 4.0, Pole·Obstacle·Sidewalk 등 14클래스)로 미리 채워져 있습니다.
+- **API 키 얻기:** https://roboflow.com 무료 로그인 → 우상단 프로필 → **Settings → Roboflow API → Private API Key** 복사
+  (또는 데이터셋 페이지에서 **Download Dataset → YOLOv8 → "show download code"** 하면 키가 포함된 스니펫이 나옵니다)
+- ⚠️ 이 데이터셋은 **55장으로 아주 작아** 정확도는 낮습니다(첫 파이프라인 검증용). 실전은 여러 데이터셋을 합치거나 AI Hub #189 권장.
+- 다른 데이터셋으로 바꾸려면 `workspace/project/version` 세 값만 교체하세요.""")
 
-code('''# [2] ↓↓↓ Roboflow "show download code" 스니펫을 여기 붙여넣기 (아래는 형식 예시) ↓↓↓
+code('''# [2] Maastricht "Sidewalk obstacle detection" (CC BY 4.0) — API 키만 채우면 됨
 from roboflow import Roboflow
-rf = Roboflow(api_key="YOUR_API_KEY")                 # ← 본인 키
-project = rf.workspace("WORKSPACE").project("PROJECT") # ← 데이터셋 스니펫 값
-dataset = project.version(1).download("yolov8")        # ← 버전 번호
+rf = Roboflow(api_key="여기에_본인_API_KEY")            # ← 이것만 바꾸기
+project = rf.workspace("maastricht-university-zxv7e").project("sidewalk-obstacle-detection")
+dataset = project.version(1).download("yolov8")
 DATA_YAML = dataset.location + "/data.yaml"
 print("DATA_YAML =", DATA_YAML)
 print(open(DATA_YAML).read())                          # 클래스 목록 확인''')
