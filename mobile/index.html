@@ -26,40 +26,68 @@
   .seg{display:flex;background:#0a1230;border-radius:12px;overflow:hidden}
   .seg button{background:transparent;border-radius:0;padding:12px 14px}
   .seg button.on{background:#24407a}
-  #status{font-size:12px;color:var(--muted);padding:0 12px 10px}
-  .chip{padding:3px 8px;border-radius:8px;background:#132043;color:var(--accent);font-weight:700}
+  #status{font-size:13px;color:var(--muted);padding:10px 4px}
+  .chip{padding:6px 10px;border-radius:8px;background:#132043;color:var(--accent);font-weight:700;font-size:14px}
   a{color:var(--accent)}
+  /* 단순 UI: 화면 전체 탭 + 설정 숨김 */
+  #stage{cursor:pointer}
+  #gear{position:absolute;top:12px;right:12px;z-index:30;width:56px;height:56px;border-radius:50%;
+    background:#000a;color:#fff;font-size:26px;border:0}
+  #hint{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;background:var(--bg);gap:18px;padding:26px;z-index:15;pointer-events:none}
+  #hintMain{font-size:10vw;font-weight:800;color:#fff;line-height:1.25}
+  #hint small{font-size:5vw;color:var(--muted);font-weight:600;line-height:1.6}
+  #settings{position:fixed;inset:0;z-index:80;background:var(--bg);overflow-y:auto;display:none;padding:16px}
+  #settings.open{display:block}
+  #settings h2{font-size:22px;margin:6px 0 16px}
+  #settings .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="stage">
+  <div id="stage" role="button" tabindex="0" aria-label="시작 또는 정지. 화면을 누르세요">
     <video id="cam" playsinline muted></video>
     <canvas id="ov"></canvas>
-    <div id="hud"><span id="fps">–</span><span id="mode">빠름</span><span id="mv">–</span></div>
-    <div id="caption">시작을 누르세요</div>
+    <div id="hud"><span id="fps">–</span><span id="mode">국내</span><span id="mv">–</span></div>
+    <div id="caption"></div>
+    <div id="hint"><span id="hintMain">화면을 눌러 시작</span>
+      <small>화면 아무 곳이나 누르면 시작하고,<br>다시 누르면 멈춥니다.<br>오른쪽 위 ⚙ 는 설정입니다.</small></div>
+    <button id="gear" aria-label="설정 열기">⚙</button>
   </div>
-  <div id="bar">
-    <button id="start" class="go">▶ 시작</button>
-    <button id="stopb" class="stop" style="display:none">■ 정지</button>
-    <div class="seg" id="modeSeg">
-      <button data-mode="coco" class="on">빠름</button>
-      <button data-mode="seg">정밀 보행로</button>
-      <button data-mode="wg">국내모델</button>
+
+  <div id="settings" role="dialog" aria-label="설정">
+    <h2>설정</h2>
+    <div class="row">
+      <button id="start" class="go">▶ 시작</button>
+      <button id="stopb" class="stop" style="display:none">■ 정지</button>
+      <button id="sound">🔊 소리 테스트</button>
     </div>
-    <button id="dangerBtn" style="background:#7a2030">위험만</button>
-    <button id="navBtn">내비 OFF</button>
-    <button id="geoBtn">위치안내 OFF</button>
-    <button id="poiAdd">여기 지점</button>
-    <button id="poiLoad">POI불러오기</button>
-    <input id="poiFile" type="file" accept=".csv,.json,text/csv" style="display:none">
-    <button id="depthBtn">깊이(실험)</button>
-    <button id="sound">🔊 소리</button>
-    <button id="videoBtn">동영상</button>
-    <input id="videoFile" type="file" accept="video/*" style="display:none">
-    <button id="test">자가검사</button>
+    <div class="row"><span class="chip">인식 모드</span>
+      <div class="seg" id="modeSeg">
+        <button data-mode="coco">빠름</button>
+        <button data-mode="seg">정밀 보행로</button>
+        <button data-mode="wg" class="on">국내모델</button>
+      </div>
+    </div>
+    <div class="row">
+      <button id="dangerBtn" style="background:#7a2030">위험만</button>
+      <button id="navBtn">내비 OFF</button>
+    </div>
+    <div class="row">
+      <button id="geoBtn">위치안내 OFF</button>
+      <button id="poiAdd">여기 지점</button>
+      <button id="poiLoad">POI불러오기</button>
+      <input id="poiFile" type="file" accept=".csv,.json,text/csv" style="display:none">
+    </div>
+    <div class="row">
+      <button id="depthBtn">깊이(실험)</button>
+      <button id="videoBtn">동영상</button>
+      <input id="videoFile" type="file" accept="video/*" style="display:none">
+      <button id="test">자가검사</button>
+    </div>
+    <div id="status">모델 로딩 대기…</div>
+    <button id="settingsClose" class="go" style="width:100%;margin-top:14px;padding:18px;font-size:18px">닫기</button>
   </div>
-  <div id="status">모델 로딩 대기…</div>
 </div>
 
 <!-- WebXR 깊이 세션용 화면 오버레이(자막) -->
@@ -87,7 +115,7 @@ const navGuide = new L.NavigationGuide();
 let navOn = false;
 let dangerOnly = true;   // 기본: 위험요소만 (길안내·참고·부정확한 계단 등 억제)
 
-let mode = "coco";            // coco | seg
+let mode = "wg";              // 기본=국내모델 (coco | seg | wg)
 let cocoModel = null, segModel = null, wgModel = null;
 let running = false, lastT = 0, frames = 0, fpsT = 0;
 let stream = null;
@@ -334,23 +362,26 @@ async function ensureModel(){
   statusEl.textContent="모델 로딩…";
   if(mode==="coco" && !cocoModel) cocoModel = await cocoSsd.load({base:"mobilenet_v2"});
   if(mode==="seg" && !segModel) segModel = await deeplab.load({base:"cityscapes",quantizationBytes:2});
-  if(mode==="wg" && !wgModel){ statusEl.textContent="국내모델 로딩(44MB, 최초 1회)…";
-    wgModel = new WGOnnxDetector("models/walkguardian/best.onnx");
-    const prov = await wgModel.load(); statusEl.textContent="국내모델 준비("+prov+")"; }
+  if(mode==="wg" && !wgModel){ statusEl.textContent="국내모델 로딩(44MB, 최초 1회)…"; $("#hintMain").textContent="국내모델 준비 중…";
+    try{ wgModel = new WGOnnxDetector("models/walkguardian/best.onnx"); await wgModel.load(); }
+    catch(e){ mode="coco"; $("#mode").textContent="빠름"; statusEl.textContent="국내모델 로드 실패 → 빠름 모드로";
+      if(!cocoModel) cocoModel = await cocoSsd.load({base:"mobilenet_v2"}); } }
 }
 function beginLoop(label){
   navGuide.stable=null; navGuide.cand=null;
   running=true; $("#start").style.display="none"; $("#stopb").style.display="";
+  $("#hint").style.display="none";                         // 시작하면 안내화면 숨김
   statusEl.textContent="동작 중 — "+label; fpsT=performance.now()/1000; loop();
 }
 async function start(){       // 카메라 모드
+  $("#hintMain").textContent="준비 중…";
   try{
     statusEl.textContent="카메라 여는 중…";
     stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280}},audio:false});
     video.srcObject=stream; video.loop=false; await video.play();
-  }catch(e){ statusEl.textContent="카메라 실패: "+e.message+" (HTTPS 필요)"; return; }
+  }catch(e){ statusEl.textContent="카메라 실패: "+e.message; $("#hintMain").textContent="카메라 권한을 켜주세요"; beep(400,300); return; }
   primeVoice(); await ensureModel();
-  beginLoop(mode==="coco"?"빠름(객체)":"정밀 보행로(전봇대·보도)");
+  beginLoop(mode==="coco"?"빠름":mode==="seg"?"정밀 보행로":"국내모델");
 }
 async function startVideo(file){  // 동영상 파일 모드 (PC/폰 공통, 카메라·방화벽 불필요)
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
@@ -365,8 +396,10 @@ function stop(){
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   try{ video.pause(); }catch(e){}
   $("#start").style.display=""; $("#stopb").style.display="none";
-  captionEl.textContent="정지됨"; captionEl.style.background="rgba(0,0,0,.55)";
+  captionEl.textContent=""; captionEl.style.background="rgba(0,0,0,.55)";
+  $("#hintMain").textContent="다시 눌러 시작"; $("#hint").style.display="";   // 안내화면 복귀
   if("speechSynthesis"in window)speechSynthesis.cancel();
+  beep(520,120);                                        // 정지 확인음
 }
 
 // ---------------- 깊이(WebXR/ARCore, 안드로이드 Chrome) ----------------
@@ -543,7 +576,18 @@ async function loadPOIFile(file){
   statusEl.textContent="POI "+added+"개 불러옴 (총 "+poiList.length+"개) — '위치안내 ON'으로 사용";
 }
 
-$("#start").onclick=start; $("#stopb").onclick=stop;
+// ── 단순 조작: 화면 전체 = 시작/정지, ⚙ = 설정 ──
+function toggleRun(){
+  if($("#settings").classList.contains("open")) return;
+  if(running){ stop(); } else if(xrSession){ try{ xrSession.end(); }catch(e){} } else { start(); }
+}
+$("#stage").addEventListener("click", toggleRun);
+$("#stage").addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggleRun(); } });
+$("#gear").addEventListener("click", e=>{ e.stopPropagation(); $("#settings").classList.add("open"); });
+$("#settingsClose").onclick=()=>$("#settings").classList.remove("open");
+
+$("#start").onclick=(e)=>{ if(e&&e.stopPropagation)e.stopPropagation(); start(); };
+$("#stopb").onclick=(e)=>{ if(e&&e.stopPropagation)e.stopPropagation(); stop(); };
 $("#depthBtn").onclick=startDepth;
 $("#xrEnd").onclick=()=>{ if(xrSession) try{ xrSession.end(); }catch(e){} };
 $("#geoBtn").onclick=()=>{ if(geoOn) stopGeo(); else startGeo(); };
