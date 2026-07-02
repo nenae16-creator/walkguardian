@@ -1,4 +1,35 @@
-# 걸음지기 AI 백엔드 (Cloudflare Worker)
+# 걸음지기 AI 백엔드
+
+앱의 **AI 설명 모드**용 서버. **OpenAI 키는 서버에만** 두고 앱엔 주소만 넣습니다(키 노출 방지).
+두 가지 방법:
+
+| 방법 | 언제 | 폰에서? |
+|---|---|---|
+| **A. 로컬(PC)** — `local_server.py` | 지금 바로 PC에서 테스트 (Cloudflare 불필요) | ❌(PC만) |
+| **B. Cloudflare Worker** — `worker.js` | 폰에서도 쓰려면 (공개 HTTPS) | ✅ |
+
+---
+
+## A. 로컬(PC)에서 바로 — 가장 빠름 ⚡
+앱과 백엔드를 **한 번에** 띄웁니다(같은 localhost라 카메라·CORS 문제 없음). 설치 필요 없음(표준 파이썬).
+
+```powershell
+# PowerShell (Windows)
+$env:OPENAI_API_KEY="sk-...재발급한_새_키..."
+python backend/local_server.py
+```
+```cmd
+:: cmd
+set OPENAI_API_KEY=sk-...새_키...
+python backend/local_server.py
+```
+→ 브라우저 **http://localhost:8000** → **⚙ 설정 → AI 백엔드 주소 =** `/analyze` → **AI 설명** 모드 → 시작.
+- 키는 **환경변수에서만** 읽습니다(코드/저장소에 없음). 셀 닫으면 사라짐.
+- PC 웹캠으로 테스트. 폰에서 쓰려면 아래 B(Worker).
+
+---
+
+## B. Cloudflare Worker (폰에서도)
 
 앱의 **AI 설명 모드**용 서버. **OpenAI 키는 여기(Worker secret)에만** 두고, 앱엔 이 Worker의 **주소만** 넣습니다.
 → 키가 공개 코드/앱에 절대 노출되지 않습니다.
