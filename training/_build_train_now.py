@@ -19,18 +19,18 @@ print("GPU:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.
 !pip -q install ultralytics roboflow
 from ultralytics import YOLO""")
 
-md("""## [2] 데이터셋 받기 (Roboflow, 무료) — API 키만 넣으면 됨
-아래 셀은 **Maastricht 'Sidewalk obstacle detection'** (CC BY 4.0, Pole·Obstacle·Sidewalk 등 14클래스)로 미리 채워져 있습니다.
-- **API 키 얻기:** https://roboflow.com 무료 로그인 → 우상단 프로필 → **Settings → Roboflow API → Private API Key** 복사
-  (또는 데이터셋 페이지에서 **Download Dataset → YOLOv8 → "show download code"** 하면 키가 포함된 스니펫이 나옵니다)
-- ⚠️ 이 데이터셋은 **55장으로 아주 작아** 정확도는 낮습니다(첫 파이프라인 검증용). 실전은 여러 데이터셋을 합치거나 AI Hub #189 권장.
-- 다른 데이터셋으로 바꾸려면 `workspace/project/version` 세 값만 교체하세요.""")
+md("""## [2] 데이터셋 받기 (Roboflow) — 새 API 키만 넣으면 됨
+아래 셀은 **Viz 'Sidewalk Detection'** (`viz-kxwrm/sidewalk-detection-d54fs` v11, 318장, Instance Segmentation)로 미리 채워져 있습니다.
+- **API 키:** https://roboflow.com 로그인 → 우상단 프로필 → **Settings → Roboflow API → Private API Key** 복사
+  (★스크린샷 등으로 노출된 키는 **Regenerate(재발급)** 후 사용)
+- 더 큰 세트를 원하면 `version(11)` → `version(7)`(증강 1489장) 등으로 숫자만 바꾸세요.
+- 완전히 다른 데이터셋: 그 페이지 URL의 `workspace/project/version` 세 값으로 교체.""")
 
-code('''# [2] Maastricht "Sidewalk obstacle detection" (CC BY 4.0) — API 키만 채우면 됨
+code('''# [2] Viz "Sidewalk Detection" (Instance Segmentation) — 새 API 키만 채우면 됨
 from roboflow import Roboflow
-rf = Roboflow(api_key="여기에_본인_API_KEY")            # ← 이것만 바꾸기
-project = rf.workspace("maastricht-university-zxv7e").project("sidewalk-obstacle-detection")
-dataset = project.version(1).download("yolov8")
+rf = Roboflow(api_key="여기에_새_API_KEY")              # ← 재발급한 새 키
+project = rf.workspace("viz-kxwrm").project("sidewalk-detection-d54fs")
+dataset = project.version(11).download("yolov8")        # 더 많게: 7(증강 1489장)
 DATA_YAML = dataset.location + "/data.yaml"
 print("DATA_YAML =", DATA_YAML)
 print(open(DATA_YAML).read())                          # 클래스 목록 확인''')
@@ -38,8 +38,17 @@ print(open(DATA_YAML).read())                          # 클래스 목록 확인
 md("""## [3] 학습 (YOLOv8)
 GUARDIAN과 동일한 `yolov8s`로 파인튜닝. 데이터가 작으면 epochs를 늘리고, 크면 줄여서 먼저 감을 잡으세요.""")
 
-code("""# [3] 학습
-model = YOLO("yolov8s.pt")
+code("""# [3] 학습 — 라벨이 세그(폴리곤)인지 탐지(박스)인지 자동 판별해 맞는 모델 선택
+import glob
+lbls = glob.glob(dataset.location + "/train/labels/*.txt")
+seg = False
+for f in lbls[:30]:
+    for ln in open(f):
+        if len(ln.split()) > 6: seg = True; break
+    if seg: break
+base = "yolov8s-seg.pt" if seg else "yolov8s.pt"
+print("라벨 형식:", "세그멘테이션" if seg else "탐지", "→ base:", base)
+model = YOLO(base)
 model.train(data=DATA_YAML, epochs=60, imgsz=640, batch=16,
             project="walkguardian", name="train_now", patience=15)""")
 
