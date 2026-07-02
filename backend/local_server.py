@@ -15,43 +15,59 @@ from pathlib import Path
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows cp949 콘솔 대비
 except Exception: pass
 
+import base64
 KEY = os.environ.get("OPENAI_API_KEY", "")
 MOBILE = str(Path(__file__).resolve().parent.parent / "mobile")
 PORT = int(os.environ.get("PORT", "8000"))
-ALLOWED = ["앞 장애물", "앞 계단 주의", "앞 턱 주의", "앞 사람", "앞 공사구간",
-           "보도 끝 주의", "앞 정차 차량", "정지, 앞 차량 접근", "앞 횡단보도", "차도입니다, 인도로"]
-SYS = ("너는 시각장애인 보행 보조다. 사진은 인도를 걷는 사람의 바로 앞 시야다. "
-       "경로 위에서 위험하거나 부딪힐 수 있는 것을 골라, 아래 '허용 문구' 중에서만 최대 2개를 JSON 배열로 답하라. "
-       "★계단·층계·단차가 조금이라도 보이면 반드시 '앞 계단 주의'를 넣어라(올라가는·내려가는 계단, 한 칸 턱, 지하철 계단 모두 포함). "
-       "내려가는 계단(바닥이 갑자기 낮아지거나 아래로 이어지는 단)은 특히 위험하니 반드시 잡아라. "
-       "전봇대·볼라드·입간판·기둥·문·화분·공사·기타 튀어나온 장애물은 '앞 장애물'. 턱(낮은 단차)은 '앞 턱 주의'. "
-       "앞을 막는 사람은 '앞 사람'. 인도가 끊기면 '보도 끝 주의'. "
-       "옆 차도의 차량은 무시(내 앞을 가로지르거나 인도로 올라오는 차만 '정지, 앞 차량 접근'). "
-       "위험 없으면 []. 설명 금지, 오직 JSON 배열. 허용 문구: " + json.dumps(ALLOWED, ensure_ascii=False))
+VOICE = os.environ.get("WG_VOICE", "nova")   # OpenAI tts 목소리
+
+VSYS = ("너는 시각장애인 보행 보조다. 사진은 걷는 사람의 바로 앞 시야다. "
+        "앞에 있는 사물·장애물·계단·턱을 아주 짧은 한국어로 알려줘. "
+        "예: '앞에 의자', '왼쪽 테이블', '앞 계단 조심', '앞 전봇대', '앞에 문'. "
+        "가장 가깝고 중요한 것 1~2개만, 전체 15자 이내로 짧게. "
+        "★계단·단차가 보이면 꼭 '계단'을 말해(특히 내려가는 계단). 옆 차도의 차량은 무시. "
+        "위험/사물이 없으면 정확히 '없음' 이라고만 답해. 문장부호·설명 금지.")
+
+
+def _openai(url, payload, timeout=30, raw=False):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read() if raw else json.loads(r.read().decode())
+
+
+def vision(image):
+    j = _openai("https://api.openai.com/v1/chat/completions", {
+        "model": "gpt-4o-mini", "temperature": 0.2, "max_tokens": 30,
+        "messages": [
+            {"role": "system", "content": VSYS},
+            {"role": "user", "content": [
+                {"type": "text", "text": "앞에 뭐가 있어?"},
+                {"type": "image_url", "image_url": {"url": image, "detail": "high"}},
+            ]},
+        ],
+    })
+    return (j["choices"][0]["message"]["content"] or "").strip().replace('"', "").replace(".", "")
+
+
+def tts(text):
+    audio = _openai("https://api.openai.com/v1/audio/speech", {
+        "model": "gpt-4o-mini-tts", "voice": VOICE, "input": text, "response_format": "mp3",
+    }, raw=True)
+    return base64.b64encode(audio).decode()
 
 
 def analyze(image):
     if not KEY or not image:
-        return []
-    payload = {
-        "model": "gpt-4o-mini", "temperature": 0, "max_tokens": 60,
-        "messages": [
-            {"role": "system", "content": SYS},
-            {"role": "user", "content": [
-                {"type": "text", "text": "이 장면의 위험을 허용 문구로만 답해."},
-                {"type": "image_url", "image_url": {"url": image, "detail": "high"}},
-            ]},
-        ],
-    }
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        j = json.loads(r.read().decode())
-    txt = j["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
-    arr = json.loads(txt)
-    return [h for h in arr if h in ALLOWED][:2] if isinstance(arr, list) else []
+        return {"text": "", "audio": ""}
+    text = vision(image)
+    if not text or text in ("없음", "없습니다", "없어요", "[]", "none", "None"):
+        return {"text": "", "audio": ""}
+    try:
+        return {"text": text, "audio": tts(text)}
+    except Exception as e:
+        print("[tts error]", e)
+        return {"text": text, "audio": ""}   # 음성 실패해도 텍스트는 반환
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -72,10 +88,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             n = int(self.headers.get("content-length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
-            hazards = analyze(body.get("image", ""))
+            result = analyze(body.get("image", ""))
         except Exception as e:
-            print("[analyze error]", e); hazards = []
-        out = json.dumps({"hazards": hazards}, ensure_ascii=False).encode()
+            print("[analyze error]", e); result = {"text": "", "audio": "", "error": str(e)}
+        out = json.dumps(result, ensure_ascii=False).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
         self._cors(); self.end_headers(); self.wfile.write(out)
 

@@ -23,7 +23,8 @@ python backend/local_server.py
 set OPENAI_API_KEY=sk-...새_키...
 python backend/local_server.py
 ```
-→ 브라우저 **http://localhost:8000** → **⚙ 설정 → AI 백엔드 주소 =** `/analyze` → **AI 설명** 모드 → 시작.
+→ 브라우저 **http://localhost:8000** 열면 **자동으로 AI 모드**로 세팅됨 → **화면 아무 곳이나 탭 → 시작**. 끝.
+- AI가 앞에 있는 사물·장애물·계단을 **자유롭게 한국어로**("앞에 의자", "앞 계단 조심" 등) 말하고, **음성까지 백엔드가 만들어** 돌려줍니다(폰에 한국어 TTS 없어도 됨).
 - 키는 **환경변수에서만** 읽습니다(코드/저장소에 없음). 셀 닫으면 사라짐.
 - PC 웹캠으로 테스트. 폰에서 쓰려면 아래 B(Worker).
 
