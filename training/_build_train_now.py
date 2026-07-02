@@ -64,16 +64,19 @@ md("""## [5] Export → 웹앱용
 - **best.pt**: 이후 재학습/추론용.
 - **TF.js**: 걸음지기 웹앱에 직접(브라우저에서 YOLO NMS 글루 필요 → 1차는 정확도 벤치마크로 먼저 활용 권장).""")
 
-code("""# [5] export
-best = "walkguardian/train_now/weights/best.pt"
-YOLO(best).export(format="onnx")
-YOLO(best).export(format="tflite")
-!pip -q install tensorflowjs
-# saved_model → tfjs (export 로그의 best_saved_model 경로 사용)
-# !tensorflowjs_converter --input_format=tf_saved_model .../best_saved_model /content/tfjs_model
+code("""# [5] best.pt 자동 탐색(폴더명 train_now2 등 무관) → 클래스/지표/export/다운로드
+import glob, os
+best = max(glob.glob("**/weights/best.pt", recursive=True), key=os.path.getmtime)
+print("찾은 best.pt:", best)
+m = YOLO(best)
+print("클래스:", m.names)                 # ← 이 목록을 개발자에게 전달
+try:
+    metrics = m.val(data=DATA_YAML); print("mAP50:", metrics.box.map50)
+except Exception as e:
+    print("val skip:", e)
+m.export(format="onnx")
 from google.colab import files
-# files.download("walkguardian/train_now/weights/best.pt")   # 필요시 다운로드
-print("완료 — weights/best.pt / best.onnx / best.tflite")""")
+files.download(best)""")
 
 md("""## [6] 걸음지기 웹앱에 연결
 1. 학습된 클래스명을 확인(예: Bollard, Curb, Light-pole, Garbage-bin ...).
