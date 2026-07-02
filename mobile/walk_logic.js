@@ -417,30 +417,37 @@
     }
   }
 
-  // data.go.kr CSV 헤더 → 위도/경도/음향신호기 컬럼 자동 탐지
+  // data.go.kr CSV 헤더 → 위도/경도/음향신호기/보행자신호 컬럼 자동 탐지
   function detectPoiColumns(headers) {
     const idx = re => headers.findIndex(h => re.test(String(h).trim()));
     return {
       lat: idx(/위도|latitude|^lat$|y좌표|위도값/i),
       lon: idx(/경도|longitude|^lon$|^lng$|x좌표|경도값/i),
-      acoustic: idx(/음향신호기.*여부|음향신호기\s*설치|음향신호기$|acoustic/i),
+      acoustic: idx(/음향신호기.*(여부|유무)|음향신호기|acoustic/i),   // '시각장애인용음향신호기유무' 포함
+      crosswalk: idx(/횡단보도|보행자작동신호기/i),
     };
   }
-  // 파싱된 헤더/행 → POI 배열 (한국 범위 밖·투영좌표·오류행 제외)
+  // 파싱된 헤더/행 → POI 배열. 표준데이터: 음향Y→음향신호기, 보행자Y→횡단보도, 차량신호→스킵.
   function rowsToPOIs(headers, rows) {
     const c = detectPoiColumns(headers), out = [];
     if (c.lat < 0 || c.lon < 0) return { pois: out, cols: c, error: "위도/경도 컬럼을 찾지 못함" };
+    const yes = v => /^(y|1|유|설치|있|o|true)/i.test(String(v == null ? "" : v).trim());
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const lat = parseFloat(r[c.lat]), lon = parseFloat(r[c.lon]);
       if (!isFinite(lat) || !isFinite(lon)) continue;
       if (lat < 33 || lat > 39 || lon < 124 || lon > 132) continue;   // 한국(WGS84) 밖·투영좌표 제외
-      let kind = "acoustic_signal";
+      let kind = null;
       if (c.acoustic >= 0) {
-        const v = String(r[c.acoustic] == null ? "" : r[c.acoustic]).trim();
-        kind = /^(y|1|유|설치|있|o|true)/i.test(v) ? "acoustic_signal" : "crosswalk_front";
+        if (yes(r[c.acoustic])) kind = "acoustic_signal";
+        else if (c.crosswalk >= 0 && yes(r[c.crosswalk])) kind = "crosswalk_front";
+        // 둘 다 아님(차량 전용 신호 등) → 스킵(과다 안내 방지)
+      } else if (c.crosswalk >= 0) {
+        if (yes(r[c.crosswalk])) kind = "crosswalk_front";
+      } else {
+        kind = "acoustic_signal";   // 컬럼 없으면 전용 현황 파일로 보고 전부 음향신호기
       }
-      out.push({ id: "csv_" + i, kind, lat, lon });
+      if (kind) out.push({ id: "csv_" + i, kind, lat, lon });
     }
     return { pois: out, cols: c };
   }
@@ -465,14 +472,16 @@
   }
 
   function selfTestCSV() {
-    const headers = ["관리번호", "위도", "경도", "음향신호기설치여부"];
-    const rows = [["1", "37.5", "127.0", "Y"], ["2", "37.6", "127.1", "N"],
-                  ["3", "bad", "x", "Y"], ["4", "10.0", "50.0", "Y"]];
-    const { pois } = rowsToPOIs(headers, rows);
-    return [
-      ["CSV 위경도·종류 매핑", pois.length === 2 && pois[0].kind === "acoustic_signal" && pois[1].kind === "crosswalk_front", pois],
-      ["오류행·한국밖 제외", pois.length === 2, pois.length],
-    ];
+    // 표준데이터형: 음향Y→음향, 음향N+보행Y→횡단보도, 둘다N→스킵, 오류/한국밖→제외
+    const h = ["위도", "경도", "시각장애인용음향신호기유무", "보행자작동신호기유무"];
+    const rows = [["37.5", "127.0", "Y", "N"], ["37.6", "127.1", "N", "Y"],
+                  ["37.7", "127.2", "N", "N"], ["bad", "x", "Y", "N"], ["10", "50", "Y", "N"]];
+    const a = rowsToPOIs(h, rows).pois;
+    const t1 = a.length === 2 && a[0].kind === "acoustic_signal" && a[1].kind === "crosswalk_front";
+    // 전용 현황형(음향/보행 컬럼 없음): 전부 음향신호기
+    const b = rowsToPOIs(["위도", "경도", "명칭"], [["37.5", "127.0", "A"], ["37.6", "127.1", "B"]]).pois;
+    const t2 = b.length === 2 && b.every(p => p.kind === "acoustic_signal");
+    return [["표준데이터 매핑(음향/보행/스킵)", t1, a], ["전용현황 전부음향", t2, b.length]];
   }
 
   global.WalkLogic = {
