@@ -10,13 +10,13 @@
   mac/Linux:           OPENAI_API_KEY=sk-... python backend/local_server.py
 그 뒤 브라우저: http://localhost:8000  → ⚙설정 → 'AI 백엔드 주소' 에  /analyze  입력 → 'AI 설명' 모드
 """
-import os, sys, json, http.server, urllib.request
+import os, sys, json, http.server, urllib.request, urllib.error
 from pathlib import Path
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows cp949 콘솔 대비
 except Exception: pass
 
 import base64
-KEY = os.environ.get("OPENAI_API_KEY", "")
+KEY = os.environ.get("OPENAI_API_KEY", "").strip().strip('"').strip("'")   # 공백·따옴표 제거
 MOBILE = str(Path(__file__).resolve().parent.parent / "mobile")
 PORT = int(os.environ.get("PORT", "8000"))
 VOICE = os.environ.get("WG_VOICE", "nova")   # OpenAI tts 목소리
@@ -60,7 +60,17 @@ def tts(text):
 def analyze(image):
     if not KEY or not image:
         return {"text": "", "audio": ""}
-    text = vision(image)
+    try:
+        text = vision(image)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode(errors="replace")
+        except Exception: pass
+        print(f"[OpenAI {e.code}] {body[:400]}")
+        return {"text": "", "audio": "", "error": f"OpenAI {e.code}: {body[:180]}"}
+    except Exception as e:
+        print("[vision error]", e)
+        return {"text": "", "audio": "", "error": str(e)}
     if not text or text in ("없음", "없습니다", "없어요", "[]", "none", "None"):
         return {"text": "", "audio": ""}
     try:
@@ -96,7 +106,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._cors(); self.end_headers(); self.wfile.write(out)
 
     def log_message(self, fmt, *args):
-        if "/analyze" in (args[0] if args else ""):
+        a0 = args[0] if args else ""
+        if isinstance(a0, str) and "/analyze" in a0:
             print("[AI]", *args)
 
 
