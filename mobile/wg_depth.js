@@ -27,7 +27,12 @@
     async estimate(src, srcW, srcH) {
       if (!this.session) return null;
       const N = this.N;
-      this.ctx.drawImage(src, 0, 0, srcW, srcH, 0, 0, N, N);   // stretch(낙차 스캔엔 충분)
+      // 하단 고정 정사각 크롭: 종횡비 왜곡 없이 발앞 바닥 영역을 그대로 분석
+      // (세로폰: 하단 정사각 = 바닥 중심 / stretch의 기하 왜곡 문제 제거)
+      const side = Math.min(srcW, srcH);
+      const sx = Math.floor((srcW - side) / 2);
+      const sy = srcH - side;
+      this.ctx.drawImage(src, sx, sy, side, side, 0, 0, N, N);
       const img = this.ctx.getImageData(0, 0, N, N).data, d = this.input, area = N * N;
       for (let i = 0; i < area; i++) {
         d[i]            = (img[i * 4]     / 255 - MEAN[0]) / STD[0];

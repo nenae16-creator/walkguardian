@@ -127,7 +127,12 @@ let mode = "wg";              // 기본=국내모델 (coco | seg | wg)
 let cocoModel = null, segModel = null, wgModel = null;
 // 단안 깊이(Depth Anything V2) — 내리막 계단/턱 낙차 감지 (ARCore 불필요)
 let depthMono=null, monoBusy=false, monoLast=0, monoEnv=null, monoAt=0, monoMs=0;
-let monoInterval=2500; const MONO_TTL=4500;
+let monoInterval=2500;
+// 안전장치(GPT 교차검증 반영): L1은 '신선한 결과 + 2연속 감지'에서만, 오래된 결과로 '정지' 금지
+let monoPrevDrop=false, monoPolVotes=[], monoFlip=false;
+let lastBeta=null;   // 폰 기울기(pitch) — 세로로 든 자세 판별용
+window.addEventListener("deviceorientation", e=>{ if(e && e.beta!=null) lastBeta=e.beta; });
+function monoTTL(){ return Math.min(3000, monoInterval*1.2); }
 async function runMonoDepth(W,H){
   const now=performance.now();
   if(!depthMono||!depthMono.session||monoBusy||now-monoLast<monoInterval) return;
@@ -137,9 +142,24 @@ async function runMonoDepth(W,H){
     const dm=await depthMono.estimate(video,W,H);
     monoMs=Math.round(performance.now()-t0);
     monoInterval=Math.min(6000, Math.max(2500, monoMs*2));   // 기기 성능에 맞춰 주기 자동 조절
-    const r=dm?L.analyzeDropoff(dm.data,dm.W,dm.H):null;
-    if(r){ monoEnv = r.prox>=0.8 ? {drop:"front"} : {stairs:"front"}; monoAt=performance.now(); }
-    else monoEnv=null;
+    if(!dm){ monoEnv=null; monoPrevDrop=false; return; }
+    // 출력 방향 자동 검증: 지속적으로 뒤집혀 있으면(변환본 차이) 반전 적용
+    const pol=L.estimatePolarity(dm.data,dm.W,dm.H);
+    monoPolVotes.push(pol); if(monoPolVotes.length>9) monoPolVotes.shift();
+    const sm=monoPolVotes.filter(v=>v==="smaller_near").length;
+    if(!monoFlip && monoPolVotes.length>=5 && sm>=monoPolVotes.length*0.8){ monoFlip=true; console.warn("[depth] polarity flipped"); }
+    let dd=dm.data;
+    if(monoFlip){ let mx=0; for(let i=0;i<dd.length;i+=7) if(dd[i]>mx) mx=dd[i];
+      const o=new Float32Array(dd.length); for(let i=0;i<dd.length;i++) o[i]=mx-dd[i]; dd=o; }
+    const r=L.analyzeDropoff(dd,dm.W,dm.H);
+    if(r){
+      // L1(정지)은 2연속 감지 + 강한 갭 + 정상 pitch(폰이 세로 자세)일 때만 — 나머지는 L2
+      const pitchOk = (lastBeta==null) || (lastBeta>35 && lastBeta<125);
+      const strong = r.prox>=0.8 && (r.gap==null || r.gap>=0.35);
+      monoEnv = (strong && monoPrevDrop && pitchOk) ? {drop:"front"} : {stairs:"front"};
+      monoPrevDrop = strong;
+      monoAt=performance.now();
+    } else { monoEnv=null; monoPrevDrop=false; }
   }catch(e){ console.warn("monodepth", e); }
   finally{ monoBusy=false; }
 }
@@ -386,8 +406,8 @@ async function loop(){
     const moving=estimateMoving();
     let dets=[], env={}, nav=null;
     if(!dangerOnly) Object.assign(env, detectSteps());   // 계단/턱은 '자세히'에서만(휴리스틱 부정확)
-    runMonoDepth(W,H);                                    // 단안 깊이(비동기, 2.5초 간격)
-    if(monoEnv && performance.now()-monoAt<MONO_TTL) Object.assign(env, monoEnv);  // 내리막→계단/낭떠러지
+    runMonoDepth(W,H);                                    // 단안 깊이(비동기, 적응형 주기)
+    if(monoEnv && performance.now()-monoAt<monoTTL()) Object.assign(env, monoEnv); // 내리막→계단/낭떠러지(신선할 때만)
     try{
       if(mode==="coco" && cocoModel){
         dets = cocoToDets(await cocoModel.detect(video, 20));

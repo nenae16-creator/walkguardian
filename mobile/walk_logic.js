@@ -387,41 +387,88 @@
     ];
   }
 
-  // ---------------- dropoff (단안 깊이 낙차 감지 — 내리막 계단/턱) ----------------
+  // ---------------- dropoff (단안 깊이 낙차 감지 — 내리막 계단/턱) v2 ----------------
   // 내리막 계단은 '모양'이 아니라 '바닥이 꺼지는 깊이 불연속'으로 잡는다.
   // 입력: 깊이맵(Float32Array, W×H row-major, 값 클수록 가까움 — Depth Anything 방식, 스케일 무관)
-  // 중앙 코리도의 컬럼들을 아래→위로 스캔, 값이 급락(≥DROP)하는 수평 끝선을 찾음.
-  const DROPOFF = { cols: 24, x0: 0.30, x1: 0.70, yTop: 0.45, drop: 0.35, nearMin: 0.25,
-                    minCols: 0.40, band: 0.08 };
+  // v2(GPT 교차검증 반영): ROI p95 정규화(outlier 강건) · 컬럼별 above/below 밴드 median 갭
+  //                       (row간 EMA 폐기) · 기울기 허용 강건 라인핏(비스듬한 접근 대응)
+  const DROPOFF = { cols: 24, x0: 0.30, x1: 0.70, yTop: 0.42, drop: 0.35, nearMin: 0.25,
+                    minCols: 0.40, slopeMax: 0.45, resid: 0.05 };
+
+  function medianOf(a) { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; }
+
+  // ROI 내부 p95 — 전역 max와 달리 반사광/헤드라이트 등 outlier 하나에 안 흔들림
+  function robustScale(data, W, H, x0, x1, y0, y1) {
+    const vals = [];
+    for (let y = Math.floor(H * y0); y < Math.floor(H * y1); y += 2)
+      for (let x = Math.floor(W * x0); x < Math.floor(W * x1); x += 2) {
+        const v = data[y * W + x];
+        if (Number.isFinite(v) && v > 0) vals.push(v);
+      }
+    if (vals.length < 50) return null;
+    vals.sort((a, b) => a - b);
+    return vals[Math.floor(vals.length * 0.95)];
+  }
+
+  // 출력 방향 추정: 보행 장면에서 하단(발앞 바닥)이 상단보다 가까워야 정상
+  function estimatePolarity(data, W, H) {
+    const med = (x0, y0, x1, y1) => { const vals = [];
+      for (let y = Math.floor(H * y0); y < Math.floor(H * y1); y += 2)
+        for (let x = Math.floor(W * x0); x < Math.floor(W * x1); x += 2) {
+          const v = data[y * W + x]; if (Number.isFinite(v)) vals.push(v);
+        }
+      return medianOf(vals); };
+    const bottom = med(0.35, 0.70, 0.65, 0.98), top = med(0.35, 0.05, 0.65, 0.30);
+    if (bottom == null || top == null) return "unknown";
+    if (bottom > top * 1.05) return "larger_near";
+    if (top > bottom * 1.05) return "smaller_near";
+    return "unknown";
+  }
+
+  function _colBandMedian(data, W, H, x, y0, y1) {
+    const vals = [];
+    for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++) {
+      const v = data[y * W + x];
+      if (Number.isFinite(v) && v > 0) vals.push(v);   // 0/NaN 결측 명시 처리(falsy 버그 제거)
+    }
+    return vals.length >= 2 ? medianOf(vals) : null;
+  }
+
   function analyzeDropoff(data, W, H, cfg) {
     const P = Object.assign({}, DROPOFF, cfg || {});
-    // 정규화: 최대값으로 나눠 0..1 (비율 판정이므로 스케일 무관하지만 nearMin 기준 통일용)
-    let mx = 0;
-    for (let i = 0; i < data.length; i += 7) { const v = data[i]; if (v > mx) mx = v; }
-    if (mx <= 0) return null;
-    const yStart = H - 2, yEnd = Math.floor(H * P.yTop);
-    const step = Math.max(1, Math.floor(H / 128));
-    const edges = [];
+    const scale = robustScale(data, W, H, P.x0, P.x1, P.yTop, 0.98);
+    if (!scale) return null;
+    const yEnd = Math.floor(H * P.yTop), yStart = H - 2;
+    const half = Math.max(3, Math.floor(H * 0.03));   // 밴드 폭(끝선이 번져도 잡힘)
+    const pts = [];
     for (let c = 0; c < P.cols; c++) {
       const x = Math.floor((P.x0 + (P.x1 - P.x0) * (c / (P.cols - 1))) * W);
-      let prev = null, edge = -1;
-      for (let y = yStart; y >= yEnd; y -= step) {
-        // 가로 3픽셀 평균(노이즈 완화)
-        const i = y * W + x;
-        const v = (data[i] + (data[i - 1] || data[i]) + (data[i + 1] || data[i])) / 3 / mx;
-        if (!(v > 0)) continue;
-        if (prev != null && prev > P.nearMin && v < prev * (1 - P.drop)) { edge = y; break; }
-        prev = prev == null ? v : prev * 0.7 + v * 0.3;   // 완만한 바닥 기울기는 흡수
+      for (let y = yStart - half; y >= yEnd + half; y--) {
+        const below = _colBandMedian(data, W, H, x, y + 1, y + half);   // 발쪽(가까워야 함)
+        const above = _colBandMedian(data, W, H, x, y - half, y - 1);   // 그 너머
+        if (below == null || above == null) continue;
+        const b = below / scale, a = above / scale;
+        if (b > P.nearMin && a < b * (1 - P.drop)) {                    // 밴드 vs 밴드 급락
+          pts.push({ x: x / W, y, gap: (b - a) / b }); break;
+        }
       }
-      if (edge >= 0) edges.push(edge);
     }
-    if (edges.length < Math.max(6, Math.floor(P.cols * P.minCols))) return null;
-    edges.sort((a, b) => a - b);
-    const med = edges[edges.length >> 1];
-    const coherent = edges.filter(e => Math.abs(e - med) <= H * P.band).length;
-    if (coherent < edges.length * 0.6) return null;        // 수평 끝선이 아니면(산발적) 무시
-    const prox = (med - yEnd) / (yStart - yEnd);           // 1=발밑, 0=먼 곳
-    return { edgeRow: med, prox: Math.max(0, Math.min(1, prox)), cols: edges.length };
+    if (pts.length < Math.max(6, Math.floor(P.cols * P.minCols))) return null;
+    // 강건 라인핏(최소자승 → 잔차컷 → 재적합): 비스듬한 끝선 허용, 산발 노이즈 제거
+    const fit = ps => { const n = ps.length; let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      for (const p of ps) { sx += p.x; sy += p.y; sxx += p.x * p.x; sxy += p.x * p.y; }
+      const d = n * sxx - sx * sx;
+      if (Math.abs(d) < 1e-9) return { a: 0, b: sy / n };
+      const a = (n * sxy - sx * sy) / d; return { a, b: (sy - a * sx) / n }; };
+    let f = fit(pts);
+    let inl = pts.filter(p => Math.abs(p.y - (f.a * p.x + f.b)) <= H * P.resid);
+    if (inl.length >= 3) { f = fit(inl); inl = pts.filter(p => Math.abs(p.y - (f.a * p.x + f.b)) <= H * P.resid); }
+    if (inl.length < Math.max(6, Math.floor(P.cols * P.minCols))) return null;
+    if (Math.abs(f.a) / H > P.slopeMax) return null;   // 너무 급한 대각선은 끝선 아님
+    const yMid = f.a * 0.5 + f.b;
+    const prox = Math.max(0, Math.min(1, (yMid - yEnd) / (yStart - yEnd)));  // 1=발밑(화면좌표 근사)
+    return { edgeRow: Math.round(yMid), prox, cols: inl.length,
+             gap: medianOf(inl.map(p => p.gap)), slope: f.a / H };
   }
 
   function selfTestDrop() {
@@ -438,14 +485,22 @@
     const noisy = mk((x, y) => 0.2 + 0.8 * y + (rnd() - 0.5) * 0.1);
     // 5) 전방 장애물(위쪽이 더 가까움) — 낙차 아님
     const obst = mk((x, y) => y > 0.65 ? 0.7 : 0.95);
+    // 6) 비스듬한 접근: 끝선이 대각선(폭 전체에 걸쳐 12% 기울기)
+    const diag = mk((x, y) => y > (0.62 + 0.12 * x) ? 0.85 : 0.25 + 0.1 * y);
+    // 7) polarity: 정상 보행장면 vs 뒤집힌 출력
+    const inv = mk((x, y) => 1.0 - (0.2 + 0.8 * y));
     const r1 = analyzeDropoff(flat, W, H), r2 = analyzeDropoff(down, W, H),
-          r3 = analyzeDropoff(up, W, H), r4 = analyzeDropoff(noisy, W, H), r5 = analyzeDropoff(obst, W, H);
+          r3 = analyzeDropoff(up, W, H), r4 = analyzeDropoff(noisy, W, H),
+          r5 = analyzeDropoff(obst, W, H), r6 = analyzeDropoff(diag, W, H);
     return [
       ["낙차: 평지 미탐지", r1 == null, r1],
       ["낙차: 내리막 탐지", r2 != null && r2.prox > 0.4, r2],
       ["낙차: 오르막 미탐지", r3 == null, r3],
       ["낙차: 노이즈 미탐지", r4 == null, r4],
       ["낙차: 장애물 미탐지", r5 == null, r5],
+      ["낙차: 대각선 끝선 탐지", r6 != null, r6],
+      ["polarity: 정상/역전 판별", estimatePolarity(flat, W, H) === "larger_near" && estimatePolarity(inv, W, H) === "smaller_near",
+        [estimatePolarity(flat, W, H), estimatePolarity(inv, W, H)]],
     ];
   }
 
@@ -568,7 +623,7 @@
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
     geo: { haversine, bearing, relSide, checkPOIs, sideWord, detectPoiColumns, rowsToPOIs },
     Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth, POIAnnouncer,
-    analyzeDropoff,
+    analyzeDropoff, estimatePolarity,
     render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, selfTestCSV, selfTestDrop,
     STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
     setRoadIgnore: v => { ROAD_IGNORE = !!v; },
