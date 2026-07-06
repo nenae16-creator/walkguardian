@@ -109,6 +109,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/deeplab@0.2.1/dist/deeplab.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
 <script src="wg_onnx.js"></script>
+<script src="wg_depth.js"></script>
 <script src="walk_logic.js"></script>
 <script>
 const $ = s => document.querySelector(s);
@@ -124,6 +125,24 @@ let dangerOnly = true;   // 기본: 위험요소만 (길안내·참고·부정�
 
 let mode = "wg";              // 기본=국내모델 (coco | seg | wg)
 let cocoModel = null, segModel = null, wgModel = null;
+// 단안 깊이(Depth Anything V2) — 내리막 계단/턱 낙차 감지 (ARCore 불필요)
+let depthMono=null, monoBusy=false, monoLast=0, monoEnv=null, monoAt=0, monoMs=0;
+let monoInterval=2500; const MONO_TTL=4500;
+async function runMonoDepth(W,H){
+  const now=performance.now();
+  if(!depthMono||!depthMono.session||monoBusy||now-monoLast<monoInterval) return;
+  monoBusy=true; monoLast=now;
+  try{
+    const t0=performance.now();
+    const dm=await depthMono.estimate(video,W,H);
+    monoMs=Math.round(performance.now()-t0);
+    monoInterval=Math.min(6000, Math.max(2500, monoMs*2));   // 기기 성능에 맞춰 주기 자동 조절
+    const r=dm?L.analyzeDropoff(dm.data,dm.W,dm.H):null;
+    if(r){ monoEnv = r.prox>=0.8 ? {drop:"front"} : {stairs:"front"}; monoAt=performance.now(); }
+    else monoEnv=null;
+  }catch(e){ console.warn("monodepth", e); }
+  finally{ monoBusy=false; }
+}
 // AI 설명 모드 (백엔드 경유, 키는 서버에만)
 let aiUrl = localStorage.getItem("wgAiUrl") || "", aiToken = localStorage.getItem("wgAiToken") || "";
 let lastAI = 0, aiBusy = false; const AI_INTERVAL = 2800;
@@ -367,6 +386,8 @@ async function loop(){
     const moving=estimateMoving();
     let dets=[], env={}, nav=null;
     if(!dangerOnly) Object.assign(env, detectSteps());   // 계단/턱은 '자세히'에서만(휴리스틱 부정확)
+    runMonoDepth(W,H);                                    // 단안 깊이(비동기, 2.5초 간격)
+    if(monoEnv && performance.now()-monoAt<MONO_TTL) Object.assign(env, monoEnv);  // 내리막→계단/낭떠러지
     try{
       if(mode==="coco" && cocoModel){
         dets = cocoToDets(await cocoModel.detect(video, 20));
@@ -389,7 +410,7 @@ async function loop(){
     }
     drawOverlay(dets, W, H);
     $("#mv").textContent = moving?"보행중":"정지";
-    frames++; if(t-fpsT>=1){ $("#fps").textContent=frames+" fps"; frames=0; fpsT=t; }
+    frames++; if(t-fpsT>=1){ $("#fps").textContent=frames+" fps"+(monoMs?(" · 깊이 "+monoMs+"ms"):""); frames=0; fpsT=t; }
   }
   requestAnimationFrame(loop);
 }
@@ -409,6 +430,12 @@ async function ensureModel(){
     try{ wgModel = new WGOnnxDetector("models/walkguardian/best.onnx"); await wgModel.load(); }
     catch(e){ mode="coco"; $("#mode").textContent="빠름"; statusEl.textContent="국내모델 로드 실패 → 빠름 모드로";
       if(!cocoModel) cocoModel = await cocoSsd.load({base:"mobilenet_v2"}); } }
+  // 단안 깊이(내리막 계단) — 카메라 모드 공통, 백그라운드 로드(준비되면 자동 동작)
+  if(mode!=="ai" && !depthMono && window.WGDepth){
+    try{ depthMono = new WGDepth("models/depth/depth_anything_v2_small_q.onnx");
+      depthMono.load().then(p=>console.log("[depth]", p)).catch(e=>{ console.warn("[depth]", e); depthMono=null; });
+    }catch(e){ depthMono=null; }
+  }
 }
 function beginLoop(label){
   navGuide.stable=null; navGuide.cand=null;
@@ -684,7 +711,7 @@ $("#test").onclick=()=>{
   statusEl.textContent="자가검사 "+r.filter(x=>x[1]).length+"/"+r.length+(ok?" 통과":" 실패");
   console.log("selfTest", r);
 };
-window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth(), ...L.selfTestGeo(), ...L.selfTestCSV()];   // 자동 검증용
+window.__selfTest = ()=>[...L.selfTest(), ...L.selfTestNav(), ...L.selfTestDepth(), ...L.selfTestGeo(), ...L.selfTestCSV(), ...L.selfTestDrop()];   // 자동 검증용
 
 // 로딩 시 음성 가용 여부 표기(voiceschanged 후 갱신)
 function refreshVoiceStatus(){ if(!running && !xrSession) statusEl.textContent = ttsStatus()+" · '시작' 또는 '동영상'"; }

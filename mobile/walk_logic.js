@@ -387,6 +387,68 @@
     ];
   }
 
+  // ---------------- dropoff (단안 깊이 낙차 감지 — 내리막 계단/턱) ----------------
+  // 내리막 계단은 '모양'이 아니라 '바닥이 꺼지는 깊이 불연속'으로 잡는다.
+  // 입력: 깊이맵(Float32Array, W×H row-major, 값 클수록 가까움 — Depth Anything 방식, 스케일 무관)
+  // 중앙 코리도의 컬럼들을 아래→위로 스캔, 값이 급락(≥DROP)하는 수평 끝선을 찾음.
+  const DROPOFF = { cols: 24, x0: 0.30, x1: 0.70, yTop: 0.45, drop: 0.35, nearMin: 0.25,
+                    minCols: 0.40, band: 0.08 };
+  function analyzeDropoff(data, W, H, cfg) {
+    const P = Object.assign({}, DROPOFF, cfg || {});
+    // 정규화: 최대값으로 나눠 0..1 (비율 판정이므로 스케일 무관하지만 nearMin 기준 통일용)
+    let mx = 0;
+    for (let i = 0; i < data.length; i += 7) { const v = data[i]; if (v > mx) mx = v; }
+    if (mx <= 0) return null;
+    const yStart = H - 2, yEnd = Math.floor(H * P.yTop);
+    const step = Math.max(1, Math.floor(H / 128));
+    const edges = [];
+    for (let c = 0; c < P.cols; c++) {
+      const x = Math.floor((P.x0 + (P.x1 - P.x0) * (c / (P.cols - 1))) * W);
+      let prev = null, edge = -1;
+      for (let y = yStart; y >= yEnd; y -= step) {
+        // 가로 3픽셀 평균(노이즈 완화)
+        const i = y * W + x;
+        const v = (data[i] + (data[i - 1] || data[i]) + (data[i + 1] || data[i])) / 3 / mx;
+        if (!(v > 0)) continue;
+        if (prev != null && prev > P.nearMin && v < prev * (1 - P.drop)) { edge = y; break; }
+        prev = prev == null ? v : prev * 0.7 + v * 0.3;   // 완만한 바닥 기울기는 흡수
+      }
+      if (edge >= 0) edges.push(edge);
+    }
+    if (edges.length < Math.max(6, Math.floor(P.cols * P.minCols))) return null;
+    edges.sort((a, b) => a - b);
+    const med = edges[edges.length >> 1];
+    const coherent = edges.filter(e => Math.abs(e - med) <= H * P.band).length;
+    if (coherent < edges.length * 0.6) return null;        // 수평 끝선이 아니면(산발적) 무시
+    const prox = (med - yEnd) / (yStart - yEnd);           // 1=발밑, 0=먼 곳
+    return { edgeRow: med, prox: Math.max(0, Math.min(1, prox)), cols: edges.length };
+  }
+
+  function selfTestDrop() {
+    const W = 64, H = 64, mk = f => { const d = new Float32Array(W * H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) d[y * W + x] = f(x / W, y / H); return d; };
+    // 1) 평지: 아래로 갈수록 가까움(값↑) — 미탐지
+    const flat = mk((x, y) => 0.2 + 0.8 * y);
+    // 2) 내리막 계단: 하단 25%만 가까운 바닥, 그 위는 갑자기 먼 아랫바닥(끝선이 발 가까이)
+    const down = mk((x, y) => y > 0.75 ? 0.85 : 0.25 + 0.1 * y);
+    // 3) 오르막 계단: 위쪽이 바닥 연장보다 '더 가까움' — 미탐지
+    const up = mk((x, y) => y > 0.6 ? 0.2 + 0.8 * y : 0.75);
+    // 4) 노이즈 평지 — 미탐지
+    let s = 7; const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+    const noisy = mk((x, y) => 0.2 + 0.8 * y + (rnd() - 0.5) * 0.1);
+    // 5) 전방 장애물(위쪽이 더 가까움) — 낙차 아님
+    const obst = mk((x, y) => y > 0.65 ? 0.7 : 0.95);
+    const r1 = analyzeDropoff(flat, W, H), r2 = analyzeDropoff(down, W, H),
+          r3 = analyzeDropoff(up, W, H), r4 = analyzeDropoff(noisy, W, H), r5 = analyzeDropoff(obst, W, H);
+    return [
+      ["낙차: 평지 미탐지", r1 == null, r1],
+      ["낙차: 내리막 탐지", r2 != null && r2.prox > 0.4, r2],
+      ["낙차: 오르막 미탐지", r3 == null, r3],
+      ["낙차: 노이즈 미탐지", r4 == null, r4],
+      ["낙차: 장애물 미탐지", r5 == null, r5],
+    ];
+  }
+
   // ---------------- geofence (공공데이터 POI: 음향신호기·횡단보도) ----------------
   // GPS 위치로 근처 POI를 감지해 방향과 함께 안내. 카메라 없이 GPS만으로 동작.
   const R_EARTH = 6371000, DEG = Math.PI / 180;
@@ -506,7 +568,9 @@
                 setBands: (n, m) => { BAND_NEAR_RATIO = n; BAND_MID_RATIO = m; } },
     geo: { haversine, bearing, relSide, checkPOIs, sideWord, detectPoiColumns, rowsToPOIs },
     Tracker, MotionTracker, WalkingRiskEngine, AlertScheduler, NavigationGuide, walkDirection, analyzeDepth, POIAnnouncer,
-    render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, selfTestCSV, STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
+    analyzeDropoff,
+    render, selfTest, selfTestNav, selfTestDepth, selfTestGeo, selfTestCSV, selfTestDrop,
+    STATIC_OBST, VEHICLE, MOTO, PERSON, DANGER_KINDS,
     setRoadIgnore: v => { ROAD_IGNORE = !!v; },
   };
 })(typeof window !== "undefined" ? window : globalThis);
